@@ -66,7 +66,7 @@ def generate_launch_description():
     env_var = AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH', model_path)
     xacro_file = os.path.join(giraffe_description_path,
                               'urdf',
-                              'giraffe.xacro.urdf')
+                              'giraffe.urdf.xacro')
 
     doc = xacro.parse(open(xacro_file))
     xacro.process_doc(doc)

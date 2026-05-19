@@ -66,7 +66,7 @@ def generate_launch_description():
     env_var = AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH', model_path)
     xacro_file = os.path.join(giraffe_description_path,
                               'urdf',
-                              'giraffe.xacro.urdf')
+                              'giraffe.urdf.xacro')
 
     doc = xacro.parse(open(xacro_file))
     xacro.process_doc(doc)
@@ -193,7 +193,7 @@ def generate_launch_description():
         # Launch gazebo environment
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                [os.path.join(get_package_share_directory('ros_ign_gazebo'),
+                [os.path.join(get_package_share_directory('ros_gz_sim'),
                               'launch', 'ign_gazebo.launch.py')]),
             launch_arguments=[('gz_args', [' -r -v 4 empty.sdf'])]),
         RegisterEventHandler(
