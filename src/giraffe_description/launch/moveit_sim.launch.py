@@ -62,6 +62,8 @@ def generate_launch_description():
     giraffe_description_share = get_package_prefix('giraffe_description')
     model_path = os.path.join(giraffe_description_path, "models")
     model_path += pathsep + os.path.join(giraffe_description_share, "share")
+    world_file = os.path.join(
+        giraffe_description_path, "worlds", "giraffe_camera_world.sdf")
 
     env_var = AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH', model_path)
     xacro_file = os.path.join(giraffe_description_path,
@@ -105,11 +107,22 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Bridge
+    # # Bridge
+    # bridge = Node(
+    #     package='ros_gz_bridge',
+    #     executable='parameter_bridge',
+    #     arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+    #     output='screen'
+    # )
+
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        arguments=[
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
+            '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+        ],
         output='screen'
     )
 
@@ -208,7 +221,7 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(
                 [os.path.join(get_package_share_directory('ros_gz_sim'),
                               'launch', 'gz_sim.launch.py')]),
-            launch_arguments=[('gz_args', [' -r -v 4 empty.sdf'])]),
+            launch_arguments=[('gz_args', [' -r -v 4 ', world_file])]),
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=ignition_spawn_entity,

@@ -15,7 +15,7 @@ ament_target_dependencies(moveit_trial
 )
 
 install(
-  DIRECTORY launch meshes models urdf rviz config src
+  DIRECTORY launch meshes models urdf rviz config src worlds
   DESTINATION share/${PROJECT_NAME}
 )
 
