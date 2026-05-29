@@ -38,3 +38,9 @@ Pick-and-Place Manipulation
 ---
 
 ## Getting Started
+
+## Remarks per commit
+
+* Need to add sensor plugin to world file for camera to work
+* Changed camera to Depth Camera in URDF and changed sensor images to sensor depth images and point cloud in the bridge node in launch file along with adding Static TF node to Launch file which gives the correct position for the depth camera in Rviz and moveit. (Check to make this in urdf only instead of launching it as static TF node)
+

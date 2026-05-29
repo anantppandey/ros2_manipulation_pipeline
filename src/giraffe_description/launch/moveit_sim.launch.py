@@ -120,10 +120,23 @@ def generate_launch_description():
         executable='parameter_bridge',
         arguments=[
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
-            '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/wrist_camera@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/wrist_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/wrist_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
             '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
         ],
         output='screen'
+    )
+
+    static_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=[
+            '0', '0', '-0.006',
+            '3.14', '0', '3.14',
+            'wrist_camera_link',
+            'giraffe/wrist_2/wrist_camera'
+        ]
     )
 
     # *** PLANNING CONTEXT *** #
@@ -247,4 +260,5 @@ def generate_launch_description():
             actions=[run_move_group_node]
         ),
         rviz_node_full,
+        static_tf,
     ])
