@@ -120,10 +120,14 @@ def generate_launch_description():
         executable='parameter_bridge',
         arguments=[
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
-            '/wrist_camera@sensor_msgs/msg/Image[gz.msgs.Image',
-            '/wrist_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+
+            '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+
             '/wrist_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+
             '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+
+            '/wrist_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
         ],
         output='screen'
     )

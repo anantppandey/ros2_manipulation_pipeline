@@ -43,4 +43,6 @@ Pick-and-Place Manipulation
 
 * Need to add sensor plugin to world file for camera to work
 * Changed camera to Depth Camera in URDF and changed sensor images to sensor depth images and point cloud in the bridge node in launch file along with adding Static TF node to Launch file which gives the correct position for the depth camera in Rviz and moveit. (Check to make this in urdf only instead of launching it as static TF node)
+* changed depth_camera to rgbd_camera in the urdf file as that was not publishing image data and fixed getting proper data from the sensor. Now Image/ camera and image are normally working and for depth_image/camera and image to show normal images first need to open /images and the turn off normalize and set max value as 5 that gives proper image and then camera also starts working. The data is being published to /wrist_camera/camera_info, /wrist_camera/depth_image, /wrist_camera/image, /wrist_camera/points.
+
 
