@@ -25,5 +25,40 @@
     <include>
       <uri>model://sun</uri>
     </include>
+    <model name="red_cube">
+      <pose>0.4 0 0.8 0 0 0</pose>
+
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+        </visual>
+
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <inertial>
+          <mass>1.0</mass>
+          <inertia>
+            <ixx>0.001</ixx>
+            <iyy>0.001</iyy>
+            <izz>0.001</izz>
+          </inertia>
+        </inertial>
+      </link>
+    </model>
   </world>
 </sdf>
