@@ -129,13 +129,13 @@ def generate_launch_description():
 
             '/wrist_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
 
-            # '/overhead_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/overhead_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
 
-            # '/overhead_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+            '/overhead_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
 
-            # '/overhead_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+            '/overhead_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
 
-            # '/overhead_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/overhead_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
         ],
 
         
@@ -150,6 +150,17 @@ def generate_launch_description():
             '3.14', '0', '3.14',
             'wrist_camera_link',
             'giraffe/wrist_2/wrist_camera'
+        ]
+    )
+
+    static_tf_2 = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=[
+            '0', '-0.25', '0',
+            '-0.3925', '3.925', '1.57',
+            'overhead_camera_link',
+            'giraffe/base_link/overhead_camera'
         ]
     )
 
@@ -275,4 +286,5 @@ def generate_launch_description():
         ),
         rviz_node_full,
         static_tf,
+        static_tf_2,
     ])
