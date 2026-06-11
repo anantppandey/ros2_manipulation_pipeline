@@ -48,5 +48,7 @@ Pick-and-Place Manipulation
  ### Stattic_TF node has the arguments as Yaw pitch Roll instead of Roll pitch yaw so you copy the Pose Values from the gazebo sensor in urdf and put there 
 
 * Added incomplete cuber detector and arm mover C++ files but they not working right now and made changes to cmake and package.xml for those c++ files
+* Commented out Wrist camera to make the moveit code work again
+* Added front camera as well 
 
 

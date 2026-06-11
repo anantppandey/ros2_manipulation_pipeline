@@ -121,13 +121,13 @@ def generate_launch_description():
         arguments=[
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
 
-            '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/front_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
 
-            '/wrist_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+            '/front_camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
 
-            '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+            '/front_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
 
-            '/wrist_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/front_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
 
             '/overhead_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
 
@@ -142,27 +142,51 @@ def generate_launch_description():
         output='screen'
     )
 
-    static_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        arguments=[
-            '0', '0', '-0.006',
-            '3.14', '0', '3.14',
-            'wrist_camera_link',
-            'giraffe/wrist_2/wrist_camera'
-        ]
-    )
+    # wrist_tf = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     arguments=[
+    #         '0', '0', '-0.006',
+    #         '3.14', '0', '3.14',
+    #         'wrist_camera_link',
+    #         'giraffe/wrist_2/wrist_camera'
+    #     ]
+    # )
+# Orignal Side camera static_TF DON'T FORGET TO ADD TO END AS WELL WEHN UNCOMMENTING
+    # static_tf_2 = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     arguments=[
+    #         '0', '-0.25', '0',
+    #         '-0.3925', '3.925', '1.57',
+    #         'overhead_camera_link',
+    #         'giraffe/base_link/overhead_camera'
+    #     ]
+    # )
 
-    static_tf_2 = Node(
+    front_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=[
             '0', '-0.25', '0',
-            '-0.3925', '3.925', '1.57',
+            '0', '0', '1.57',
+            'front_camera_link',
+            'giraffe/base_link/front_camera'
+        ]
+    )
+
+    overhead_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=[
+            '0', '0', '0',
+            '0', '1.57', '0',
             'overhead_camera_link',
             'giraffe/base_link/overhead_camera'
         ]
     )
+
+
 
     # *** PLANNING CONTEXT *** #
     # Robot description, SRDF:
@@ -285,6 +309,6 @@ def generate_launch_description():
             actions=[run_move_group_node]
         ),
         rviz_node_full,
-        static_tf,
-        static_tf_2,
+        overhead_tf,
+        front_tf
     ])
