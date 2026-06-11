@@ -40,12 +40,23 @@ ament_target_dependencies(cube_picker
   moveit_ros_planning_interface
 )
 
+add_executable(end_effector_pose src/end_effector_pose.cpp)
+
+ament_target_dependencies(end_effector_pose
+  rclcpp
+  moveit_ros_planning_interface
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
+)
+
+
 install(
   DIRECTORY launch meshes models urdf rviz config src worlds
   DESTINATION share/${PROJECT_NAME}
 )
 
-install(TARGETS moveit_trial red_cube_detector cube_picker
+install(TARGETS moveit_trial red_cube_detector cube_picker end_effector_pose
   DESTINATION lib/${PROJECT_NAME}
 )
 

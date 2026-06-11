@@ -123,14 +123,25 @@ int main(int argc, char *argv[])
 
     geometry_msgs::msg::Pose target_pose;
 
-    target_pose.position.x = 0.093;
-    target_pose.position.y = 0.239;
-    target_pose.position.z = 0.257;
+    //Base Pose
+    // target_pose.position.x = 0.009;
+    // target_pose.position.y = 0.33;
+    // target_pose.position.z = 0.183;
 
-    target_pose.orientation.x = -0.465;
-    target_pose.orientation.y = 0.812;
-    target_pose.orientation.z = -0.310;
-    target_pose.orientation.w = 0.167;
+    // target_pose.orientation.x = -0.706;
+    // target_pose.orientation.y = 0.707;
+    // target_pose.orientation.z = -0.0029;
+    // target_pose.orientation.w = -0.0028;
+
+
+    target_pose.position.x = 0.3894;
+    target_pose.position.y = 0.4182;
+    target_pose.position.z = -0.1366;
+
+    target_pose.orientation.x = -0.7068;
+    target_pose.orientation.y = 0.7073;
+    target_pose.orientation.z = -0.0029;
+    target_pose.orientation.w = -0.0028;
 
     move_group_interface.setPoseTarget(target_pose);
 
