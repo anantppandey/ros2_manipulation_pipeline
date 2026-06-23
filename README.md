@@ -50,5 +50,6 @@ Pick-and-Place Manipulation
 * Added incomplete cuber detector and arm mover C++ files but they not working right now and made changes to cmake and package.xml for those c++ files
 * Commented out Wrist camera to make the moveit code work again
 * Added front camera as well 
+* Changed Urdf to have 0 variation in the pose of sensor and just rotated the camera itself and fixed launch tf for it as well and fixed the red cube detector to give the correct positioin of the cube
 
 

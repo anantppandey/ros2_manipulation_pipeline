@@ -180,7 +180,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         arguments=[
             '0', '0', '0',
-            '0', '1.57', '0',
+            '0', '0', '0',
             'overhead_camera_link',
             'giraffe/base_link/overhead_camera'
         ]
@@ -310,5 +310,5 @@ def generate_launch_description():
         ),
         rviz_node_full,
         overhead_tf,
-        front_tf
+        front_tf,
     ])
