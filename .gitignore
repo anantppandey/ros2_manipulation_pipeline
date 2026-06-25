@@ -1,6 +1,7 @@
 build/
 install/
 log/
+src/moveit_task_constructor/
 
 .vscode/
 *.pyc

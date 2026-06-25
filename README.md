@@ -39,6 +39,47 @@ Pick-and-Place Manipulation
 
 ## Getting Started
 
+## MoveIt Task Constructor Setup
+
+This project depends on MoveIt Task Constructor (MTC), which is not included in this repository.
+
+### Clone the repository
+
+```bash
+cd ~/ft_ws/src
+
+git clone --branch ros2 https://github.com/moveit/moveit_task_constructor.git
+```
+
+### Initialize submodules
+
+```bash
+cd moveit_task_constructor
+
+git submodule update --init --recursive
+```
+
+### Install dependencies
+
+```bash
+cd ~/ft_ws
+
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+### Build the workspace
+
+```bash
+colcon build --symlink-install
+```
+
+After building, source the workspace:
+
+```bash
+source ~/ft_ws/install/setup.zsh
+```
+
+
 ## Remarks per commit
 
 * Need to add sensor plugin to world file for camera to work
