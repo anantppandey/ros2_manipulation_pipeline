@@ -51,5 +51,6 @@ Pick-and-Place Manipulation
 * Commented out Wrist camera to make the moveit code work again
 * Added front camera as well 
 * Changed Urdf to have 0 variation in the pose of sensor and just rotated the camera itself and fixed launch tf for it as well and fixed the red cube detector to give the correct positioin of the cube
+* Fixed movit trail as it was not getting the same movit parameters as launch file so made a launch file for it so now has kinametic.yaml file and all also fixed the timing issue by adding use sim time.
 
 
