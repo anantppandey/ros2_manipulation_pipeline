@@ -23,6 +23,7 @@ ament_target_dependencies(
 
 target_link_libraries(mtc_node
     moveit_task_constructor_core::moveit_task_constructor_core
+    moveit_task_constructor_core::moveit_task_constructor_core_stages
 )
 
 install(TARGETS
