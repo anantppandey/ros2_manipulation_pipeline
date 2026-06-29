@@ -26,6 +26,11 @@ target_link_libraries(mtc_node
     moveit_task_constructor_core::moveit_task_constructor_core_stages
 )
 
+install(
+  DIRECTORY launch src 
+  DESTINATION share/${PROJECT_NAME}
+)
+
 install(TARGETS
     mtc_node
     DESTINATION lib/${PROJECT_NAME}
