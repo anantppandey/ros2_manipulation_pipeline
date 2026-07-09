@@ -45,11 +45,34 @@ int main(int argc, char** argv)
     auto move = std::make_unique<stages::MoveTo>("Move To Rest", planner);
     move->setGroup("arm");
     move->setGoal("rest");
+
+    // auto move = std::make_unique<stages::MoveTo>("move to cube", planner);
+    // move->setGroup("arm");
+
+    // geometry_msgs::msg::PoseStamped target_pose;
+
+    // target_pose.header.frame_id = "world";
+    // target_pose.header.stamp = node->now();
+
+    // target_pose.pose.position.x = 0.09;
+    // target_pose.pose.position.y = 0.35;
+    // target_pose.pose.position.z = 0.07;
+
+    // target_pose.pose.orientation.x = -0.59;
+    // target_pose.pose.orientation.y = 0.81;
+    // target_pose.pose.orientation.z = -0.02;
+    // target_pose.pose.orientation.w = -0.02;
+
+    move->setIKFrame("wrist_2");
+
+    // move->setGoal(target_pose);
+
     task.add(std::move(move));
 
     // Initialize
     try
     {
+        rclcpp::sleep_for(std::chrono::seconds(2));
         task.init();
         // rclcpp::sleep_for(std::chrono::seconds(30));
     }

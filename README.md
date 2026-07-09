@@ -97,6 +97,6 @@ source ~/ft_ws/install/setup.zsh
 ## MTC Started
 * changes to cmake and code colcon build working
 * The main issue was that MoveIt Task Constructor (MTC) could not initialize its internal OMPL planning pipeline, even though the robot model, SRDF, and kinematics were loading correctly. Initially, the MTC node was launched with manually loaded URDF, SRDF, kinematics, and OMPL YAML files, which did not recreate the complete MoveIt configuration expected by the planning pipeline. The solution was to launch the MTC node using MoveItConfigsBuilder and moveit_config.to_dict(), just like the official MoveIt/MTC demos. This automatically provided the complete planning pipeline configuration (including OMPL, adapters, joint limits, and planning parameters), allowing MTC to successfully initialize the planner and generate valid motion plans.
-
-
+* Added Publisher to Red Cube detector and changes to mtc_node 
+* Movit Trial finally working as intended By combining Eigen geometry (to calculate the base angle and rotate the orientation) with KDL (to solve the remaining wrist pitches), we essentially wrote a custom 5-DOF IK solver wrapper. We gave KDL an easy puzzle, and gave OMPL a joint-based goal. That is why it works flawlessly. (For more details see how movit trail works in documets)
 

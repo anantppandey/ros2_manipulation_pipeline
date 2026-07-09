@@ -11,10 +11,13 @@ find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-find_package(tf2 REQUIRED)  # Add this
+find_package(tf2 REQUIRED)  
 find_package(image_geometry REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(moveit_ros_planning REQUIRED)
+find_package(moveit_msgs REQUIRED)
+find_package(shape_msgs REQUIRED)
 
 add_executable(moveit_trial src/moveit_trial.cpp)
 ament_target_dependencies(moveit_trial

@@ -30,6 +30,9 @@ public:
         // Subscribers for RGB and depth
         rgb_sub_.subscribe(this, "/overhead_camera/image");
         depth_sub_.subscribe(this, "/overhead_camera/depth_image");
+
+        // Publisher for detected cube pose
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/cube_pose",10);
         
         // Sync RGB and depth
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
@@ -169,8 +172,29 @@ private:
                         // world_z = 0.75 - z_cam  (camera looks down)
                         
                         float world_x = 0.25 - x_cam;
-                        float world_y = y_cam + 0.004;
-                        float world_z = 0.75 - z_cam;
+                        float world_y = y_cam ;
+                        float world_z = 0.75 - z_cam + 0.04;  // small offset for cube height
+
+                        geometry_msgs::msg::PoseStamped pose;
+
+                        pose.header.stamp = this->now();
+                        pose.header.frame_id = "world";
+
+                        pose.pose.position.x = world_x;
+                        pose.pose.position.y = world_y;
+                        pose.pose.position.z = world_z;
+                        // Orientation 
+                        pose.pose.orientation.x = -0.59;
+                        pose.pose.orientation.y = 0.81;
+                        pose.pose.orientation.z = -0.02;
+                        pose.pose.orientation.w = -0.02;
+
+                        //     target.orientation.x = -0.59;
+                        //     target.orientation.y = 0.81;
+                        //     target.orientation.z = -0.02;
+                        //     target.orientation.w = -0.02;
+
+                        pose_pub_->publish(pose);
                         
                         RCLCPP_INFO(this->get_logger(), "🎯 Cube in WORLD frame: (%.3f, %.3f, %.3f) meters", 
                                    world_x, world_y, world_z);
@@ -272,6 +296,9 @@ private:
     // TF2
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+    // Publisher
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     
     // Camera intrinsics
     double fx_ = 0.0, fy_ = 0.0, cx_ = 0.0, cy_ = 0.0;
