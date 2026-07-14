@@ -14,11 +14,10 @@ add_executable(mtc_node
     src/mtc_node.cpp
 )
 
-ament_target_dependencies(
-    mtc_node
-    rclcpp
-    moveit_core
-    moveit_ros_planning_interface
+ament_target_dependencies(mtc_node
+  rclcpp
+  moveit_ros_planning_interface
+  moveit_task_constructor_core
 )
 
 target_link_libraries(mtc_node

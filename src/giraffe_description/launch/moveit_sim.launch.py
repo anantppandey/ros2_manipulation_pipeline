@@ -254,9 +254,24 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
             {"use_sim_time": True},
+            {
+                # In ROS 2 Jazzy, capabilities must be passed as "capability_plugins"
+                "capability_plugins": [
+                    "move_group/MoveGroupCartesianPathService",
+                    "move_group/MoveGroupExecuteTrajectoryAction",
+                    "move_group/MoveGroupKinematicsService",
+                    "move_group/MoveGroupMoveAction",
+                    "move_group/MoveGroupPlanService",
+                    "move_group/MoveGroupQueryPlannersService",
+                    "move_group/MoveGroupStateValidationService",
+                    "move_group/MoveGroupGetPlanningSceneService",
+                    "move_group/ApplyPlanningSceneService",
+                    "move_group/ClearOctomapService",
+                    "moveit_task_constructor_core/ExecuteTaskSolutionCapability", # <-- MTC Plugin
+                ]
+            }
         ],
     )
-
     # RVIZ:
     rviz_base = os.path.join(get_package_share_directory("giraffe_moveit_config"), "config")
     rviz_full_config = os.path.join(rviz_base, "moveit.rviz")
