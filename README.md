@@ -100,3 +100,14 @@ source ~/ft_ws/install/setup.zsh
 * Added Publisher to Red Cube detector and changes to mtc_node 
 * Movit Trial finally working as intended By combining Eigen geometry (to calculate the base angle and rotate the orientation) with KDL (to solve the remaining wrist pitches), we essentially wrote a custom 5-DOF IK solver wrapper. We gave KDL an easy puzzle, and gave OMPL a joint-based goal. That is why it works flawlessly. (For more details see how movit trail works in documets)
 
+
+### Implementation Notes: MoveIt Task Constructor (MTC) in ROS 2 Jazzy
+
+* **Node Architecture:** Transitioned from standard `MoveGroupInterface` planning to an MTC `Task` pipeline, utilizing `PlanningSceneMonitor` to fetch the current robot state directly.
+* **Custom 5-DOF IK Integration:** Preserved the custom inverse kinematics math (base yaw alignment + seeded IK) and passed the resulting joint targets to an MTC `MoveTo` stage using a `std::map<std::string, double>`.
+* **Launch File Parameters:** Injected `planning_pipelines` (OMPL) and `robot_description_planning` (joint limits) directly into the node's namespace, as MTC runs the planning pipeline internally rather than querying the `move_group` node.
+* **Time Parameterization Fix:** Added strict joint acceleration limits to `joint_limits.yaml` to prevent the `AddTimeOptimalParameterization` (TOTG) adapter from failing during trajectory generation.
+* **Execution Server Workaround:** Bypassed the missing `execute_task_solution` MTC action server in Jazzy by dynamically casting the MTC `SolutionSequence` to extract the `RobotTrajectory`, then executing it sequentially via the standard `MoveGroupInterface::execute()`.
+* **Relative Motion Stages:** Added a 90-degree wrist rotation using an MTC `MoveRelative` stage, noting that it requires `setDirection()` instead of `setGoal()`.
+
+* Gripper Actuation in Gazebo: The gripper required a combination of URDF, YAML, and C++ adjustments to actuate smoothly. Realistic velocity limits (0.5 rad/s) and widened floating-point bounds (-0.05) were added to the URDF to prevent MoveIt bounds-checking failures and instant snapping. To bypass a missing MTC execution plugin in ROS 2 Jazzy, the final trajectory was extracted directly from the MTC SolutionSequence, re-parameterized via TOTG, and executed natively via MoveGroupInterface.

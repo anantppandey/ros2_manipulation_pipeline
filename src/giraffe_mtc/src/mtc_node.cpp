@@ -9,6 +9,8 @@
 #include <moveit/move_group_interface/move_group_interface.hpp>
 #include <moveit/planning_scene_interface/planning_scene_interface.hpp>
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
+#include <moveit/planning_scene/planning_scene.h>
+#include <moveit/trajectory_processing/time_optimal_trajectory_generation.h>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -22,8 +24,11 @@
 #include <moveit/task_constructor/container.h>
 #include <moveit/task_constructor/stage.h>
 #include <moveit/task_constructor/stages/current_state.h>
+#include <moveit/task_constructor/stages/fixed_state.h>
 #include <moveit/task_constructor/stages/move_to.h>
+#include <moveit/task_constructor/stages/move_relative.h>
 #include <moveit/task_constructor/solvers/pipeline_planner.h>
+#include <moveit/task_constructor/solvers/joint_interpolation.h>
 #include <moveit/utils/moveit_error_code.hpp>
 
 namespace mtc = moveit::task_constructor;
@@ -86,6 +91,7 @@ int main(int argc, char *argv[])
     
     RCLCPP_INFO(logger, "Waiting for robot state...");
     monitor->waitForCompleteState("arm", 5.0);
+    monitor->waitForCompleteState("gripper", 5.0);
     moveit::core::RobotStatePtr current_state = monitor->getCurrentState();
     
     if (!current_state) {
@@ -200,16 +206,36 @@ int main(int argc, char *argv[])
     // MOVEIT TASK CONSTRUCTOR SETUP
     // ==========================================
     
-    // Stage 1: Current State
-    auto current_stage = std::make_unique<mtc::stages::CurrentState>("current state");
-    task.add(std::move(current_stage));
-
-    // Create a planner
     auto pipeline = std::make_shared<mtc::solvers::PipelinePlanner>(node);
     pipeline->setProperty("max_velocity_scaling_factor", 0.2);
     pipeline->setProperty("max_acceleration_scaling_factor", 0.2);
 
-    // Stage 2: Move to Target Joints
+    auto gripper_pipeline = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+    gripper_pipeline->setMaxVelocityScalingFactor(0.1);
+    gripper_pipeline->setMaxAccelerationScalingFactor(0.1);
+
+    // Stage 1: Fixed Current State (Clamped to 0.0 to prevent Gazebo float errors)
+    auto scene = std::make_shared<planning_scene::PlanningScene>(robot_model);
+    moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
+    scene_state = *current_state;
+    
+    double safe_zero = 0.0;
+    scene_state.setJointPositions("wrist_2_gripper_joint", &safe_zero);
+
+    auto current_stage = std::make_unique<mtc::stages::FixedState>("current state");
+    current_stage->setState(scene);
+    task.add(std::move(current_stage));
+
+    // Stage 2: Open Gripper
+    auto open_gripper = std::make_unique<mtc::stages::MoveTo>("open gripper", gripper_pipeline);
+    open_gripper->setGroup("gripper");
+    std::map<std::string, double> gripper_open;
+    gripper_open["wrist_2_gripper_joint"] = 1.0; 
+    open_gripper->setGoal(gripper_open);
+    open_gripper->setProperty("timeout", 5.0);
+    task.add(std::move(open_gripper));
+
+    // Stage 3: Move Arm to Target Joints
     auto move_to = std::make_unique<mtc::stages::MoveTo>("move to target", pipeline);
     move_to->setGroup("arm");
     
@@ -221,7 +247,20 @@ int main(int argc, char *argv[])
     move_to->setProperty("timeout", 10.0);
     task.add(std::move(move_to));
 
-    // Plan
+    // Stage 4: Rotate Wrist 90 Degrees
+    auto rotate_wrist = std::make_unique<mtc::stages::MoveRelative>("rotate wrist", pipeline);
+    rotate_wrist->setGroup("arm");
+    
+    std::map<std::string, double> joint_deltas;
+    joint_deltas["wrist_1_wrist_2_joint"] = M_PI / 2.0; 
+    
+    rotate_wrist->setDirection(joint_deltas); 
+    rotate_wrist->setProperty("timeout", 10.0);
+    task.add(std::move(rotate_wrist));
+
+    // ==========================================
+    // PLAN & EXECUTE
+    // ==========================================
     RCLCPP_INFO(logger, "Planning with MTC...");
     auto result = task.plan(1);
 
@@ -229,12 +268,12 @@ int main(int argc, char *argv[])
     {
         RCLCPP_INFO(logger, "MTC Planning SUCCESS! Extracting trajectory...");
 
-        // Re-add MoveGroupInterface JUST for standard execution
         using moveit::planning_interface::MoveGroupInterface;
-        MoveGroupInterface move_group(node, "arm");
-        move_group.startStateMonitor();
+        MoveGroupInterface arm_group(node, "arm");
+        MoveGroupInterface gripper_group(node, "gripper");
+        arm_group.startStateMonitor();
+        gripper_group.startStateMonitor();
 
-        // Extract the trajectory directly from the MTC solution
         auto sol = task.solutions().front();
         auto compound = dynamic_cast<const mtc::SolutionSequence*>(sol.get());
         
@@ -243,22 +282,61 @@ int main(int argc, char *argv[])
                 auto traj = dynamic_cast<const mtc::SubTrajectory*>(sub);
                 if (traj && traj->trajectory()) {
                     
+                    auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
+                    std::string group_name = rt->getGroupName();
+
                     MoveGroupInterface::Plan plan;
-                    traj->trajectory()->getRobotTrajectoryMsg(plan.trajectory);
                     
-                    RCLCPP_INFO(logger, "Executing trajectory via standard MoveGroupInterface...");
-                    move_group.execute(plan);
-                    break;
+                    if (group_name == "gripper") {
+                        RCLCPP_INFO(logger, "Executing Gripper trajectory...");
+                        // TOTG will respect the 0.5 rad/s limit we set in the URDF
+                        trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                        totg.computeTimeStamps(*rt, 0.1, 0.1);
+                    } else {
+                        RCLCPP_INFO(logger, "Executing Arm trajectory...");
+                        trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                        totg.computeTimeStamps(*rt, 0.1, 0.1);
+                    }
+
+                    rt->getRobotTrajectoryMsg(plan.trajectory);
+                    
+                    if (plan.trajectory.joint_trajectory.points.empty()) {
+                        RCLCPP_WARN(logger, "Skipping empty trajectory for %s", group_name.c_str());
+                        continue;
+                    }
+
+                    if (group_name == "gripper") {
+                        gripper_group.execute(plan);
+                    } else {
+                        arm_group.execute(plan);
+                    }
                 }
             }
         } else {
-            // In case it's just a single SubTrajectory
             auto traj = dynamic_cast<const mtc::SubTrajectory*>(sol.get());
             if (traj && traj->trajectory()) {
+                auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
+                std::string group_name = rt->getGroupName();
+                
                 MoveGroupInterface::Plan plan;
-                traj->trajectory()->getRobotTrajectoryMsg(plan.trajectory);
-                RCLCPP_INFO(logger, "Executing trajectory via standard MoveGroupInterface...");
-                move_group.execute(plan);
+                if (group_name == "gripper") {
+                    RCLCPP_INFO(logger, "Executing Gripper trajectory...");
+                    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                    totg.computeTimeStamps(*rt, 0.1, 0.1);
+                } else {
+                    RCLCPP_INFO(logger, "Executing Arm trajectory...");
+                    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                    totg.computeTimeStamps(*rt, 0.1, 0.1);
+                }
+                
+                rt->getRobotTrajectoryMsg(plan.trajectory);
+                if (!plan.trajectory.joint_trajectory.points.empty()) {
+                    if (group_name == "gripper") {
+                        gripper_group.execute(plan);
+                    } else {
+                        arm_group.execute(plan);
+                    }
+                }
             }
         }
     }

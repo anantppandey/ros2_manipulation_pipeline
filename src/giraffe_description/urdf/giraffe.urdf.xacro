@@ -228,7 +228,8 @@
         <parent link="wrist_2" />
         <child link="gripper" />
         <axis xyz="-0.007420635544791429 -0.0007590000001611277 -0.9999726580742655" />
-        <limit lower="0.0" upper="1.570796" effort="1000000" velocity="1000000" />
+        <!-- CHANGE THIS LINE -->
+        <limit lower="-0.05" upper="1.570796" effort="1000000" velocity="0.5" />
     </joint>
 
     <transmission name="shoulder_pan_trans">

@@ -79,9 +79,9 @@ gripper_controller:
       - position
 
     gains:
-      wrist_2_gripper_joint: {p: 50.0, i: 0.0, d: 10.0, i_clamp: 0.0}
+      wrist_2_gripper_joint: {p: 100.0, i: 0.0, d: 15.0, i_clamp: 0.0}
     state_publish_topic: controller_state
-    open_loop_control: true
+    open_loop_control: false               # <--- SET TO TRUE
     state_publish_rate: 100.0
     action_monitor_rate: 20.0
     allow_partial_joints_goal: true
@@ -89,5 +89,4 @@ gripper_controller:
 
     constraints:
       stopped_velocity_tolerance: 0.2
-      # goal_time: 0.0
-      wrist_2_gripper_joint: { trajectory: 0.4, goal: 0.4 }
+      wrist_2_gripper_joint: { trajectory: 0.1, goal: 0.1 } # Tolerance 0.0
