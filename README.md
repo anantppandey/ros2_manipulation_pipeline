@@ -111,3 +111,10 @@ source ~/ft_ws/install/setup.zsh
 * **Relative Motion Stages:** Added a 90-degree wrist rotation using an MTC `MoveRelative` stage, noting that it requires `setDirection()` instead of `setGoal()`.
 
 * Gripper Actuation in Gazebo: The gripper required a combination of URDF, YAML, and C++ adjustments to actuate smoothly. Realistic velocity limits (0.5 rad/s) and widened floating-point bounds (-0.05) were added to the URDF to prevent MoveIt bounds-checking failures and instant snapping. To bypass a missing MTC execution plugin in ROS 2 Jazzy, the final trajectory was extracted directly from the MTC SolutionSequence, re-parameterized via TOTG, and executed natively via MoveGroupInterface.
+
+
+Implementation Notes: Grasping and Object Attachment
+
+Grasp Sequence & Collision Handling: Added descent, close-gripper, and lift stages using pre-calculated 5-DOF IK targets. Expanded the allowCollisions stage to include both arm and gripper links, preventing OMPL from aborting when the gripper contacted the cube.
+Manual Object Attachment: Because we bypassed MTC's internal execution server, MTC's attachObject stage didn't reach the real move_group node. We fixed this by intercepting the "lift up" trajectory in our execution loop and manually calling arm_group.attachObject() to synchronize the real MoveIt planning scene, ensuring the cube's collision geometry moved with the gripper.
+Decoupled Offsets: Split the RViz cube pose offsets from the Gazebo gripper target offsets to independently tune visual accuracy and physical grasp alignment.
