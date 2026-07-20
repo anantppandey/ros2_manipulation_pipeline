@@ -2,7 +2,25 @@
 <robot name="giraffe" xmlns:xacro="http://www.ros.org/wiki/xacro" >
 
     <xacro:macro name="giraffe_ros2_control">
-            <gazebo>
+        <gazebo>
+            <!-- Add the Detachable Joint System -->
+            <!-- <plugin filename="gz-sim-detachable-joint-system"
+                    name="gz::sim::systems::DetachableJoint">
+
+                <parent_link>gripper</parent_link>
+
+                <child_model>red_cube</child_model>
+
+                <child_link>link</child_link>
+
+                <detach_topic>/detach_cube</detach_topic>
+
+                <attach_topic>/attach_cube</attach_topic>
+
+                <output_topic>/cube_state</output_topic>
+
+            </plugin> -->
+
             <plugin filename="ign_ros2_control-system" name="ign_ros2_control::IgnitionROS2ControlPlugin">
                 <robot_param>robot_description</robot_param>
                 <robot_param_node>robot_state_publisher</robot_param_node>

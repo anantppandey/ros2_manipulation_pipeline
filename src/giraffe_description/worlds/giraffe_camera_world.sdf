@@ -27,7 +27,6 @@
     </include>
     <model name="red_cube">
       <pose>0.1 0.4 0.015 0 0 0</pose>
-
       <link name="link">
         <visual name="visual">
           <geometry>
@@ -35,13 +34,11 @@
               <size>0.03 0.03 0.03</size>
             </box>
           </geometry>
-
           <material>
             <ambient>1 0 0 1</ambient>
             <diffuse>1 0 0 1</diffuse>
           </material>
         </visual>
-
         <collision name="collision">
           <geometry>
             <box>
@@ -49,7 +46,6 @@
             </box>
           </geometry>
         </collision>
-
         <inertial>
           <mass>1.0</mass>
           <inertia>
@@ -59,6 +55,119 @@
           </inertia>
         </inertial>
       </link>
+
+      <!-- <plugin filename="gz-sim-detachable-joint-system" name="gz::sim::systems::DetachableJoint">
+        <parent_link>link</parent_link>
+        <child_model>giraffe</child_model>
+        <child_link>gripper</child_link>
+        <topic>/attach_cube</topic>
+      </plugin> -->
     </model>
+
+    <model name="collection_box">
+      <static>true</static>
+
+      <pose>-0.15 0.3 0 0 0 0</pose>
+
+      <link name="box">
+
+        <!-- Bottom -->
+        <collision name="bottom_collision">
+          <pose>0 0 0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.09 0.01</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="bottom_visual">
+          <pose>0 0 0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.09 0.01</size>
+            </box>
+          </geometry>
+        </visual>
+
+        <!-- Left wall -->
+        <collision name="left_collision">
+          <pose>0 0.04 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.01 0.06</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="left_visual">
+          <pose>0 0.04 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.01 0.06</size>
+            </box>
+          </geometry>
+        </visual>
+
+        <!-- Right wall -->
+        <collision name="right_collision">
+          <pose>0 -0.04 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.01 0.06</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="right_visual">
+          <pose>0 -0.04 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.09 0.01 0.06</size>
+            </box>
+          </geometry>
+        </visual>
+
+        <!-- Front wall -->
+        <collision name="front_collision">
+          <pose>0.04 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.07 0.06</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="front_visual">
+          <pose>0.04 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.07 0.06</size>
+            </box>
+          </geometry>
+        </visual>
+
+        <!-- Back wall -->
+        <collision name="back_collision">
+          <pose>-0.04 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.07 0.06</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="back_visual">
+          <pose>-0.04 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.07 0.06</size>
+            </box>
+          </geometry>
+        </visual>
+
+      </link>
+    </model>
+
   </world>
 </sdf>
