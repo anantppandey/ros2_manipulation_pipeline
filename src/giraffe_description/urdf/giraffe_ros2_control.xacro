@@ -21,6 +21,14 @@
 
             </plugin> -->
 
+            <!-- Custom Attach Plugin -->
+            <plugin filename="libgiraffe_gazebo_plugins.so" 
+                    name="giraffe_gazebo_plugins::CustomAttachPlugin">
+                <parent_link>gripper</parent_link>
+                <child_model>red_cube</child_model>
+                <child_link>link</child_link>
+            </plugin>
+
             <plugin filename="ign_ros2_control-system" name="ign_ros2_control::IgnitionROS2ControlPlugin">
                 <robot_param>robot_description</robot_param>
                 <robot_param_node>robot_state_publisher</robot_param_node>

@@ -291,6 +291,14 @@ def generate_launch_description():
              "default_planning_pipeline": "ompl"},
         ]
     )
+
+
+    giraffe_gazebo_plugins_prefix = get_package_prefix('giraffe_gazebo_plugins')
+    env_var_plugin_path = AppendEnvironmentVariable(
+        'GZ_SIM_SYSTEM_PLUGIN_PATH',
+        os.path.join(giraffe_gazebo_plugins_prefix, 'lib'))
+
+
     return LaunchDescription([
         env_var,
         # Launch gazebo environment
@@ -326,4 +334,5 @@ def generate_launch_description():
         rviz_node_full,
         overhead_tf,
         front_tf,
+        env_var_plugin_path,
     ])

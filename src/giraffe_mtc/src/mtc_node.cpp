@@ -32,6 +32,9 @@
 #include <moveit/utils/moveit_error_code.hpp>
 #include <moveit/task_constructor/stages/modify_planning_scene.h>
 
+
+#include <std_srvs/srv/trigger.hpp>
+
 namespace mtc = moveit::task_constructor;
 
 geometry_msgs::msg::Pose latest_pose;
@@ -157,6 +160,20 @@ int main(int argc, char *argv[])
 
     rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(node);
+
+    // Create service clients for Gazebo attach/detach
+    auto attach_client = node->create_client<std_srvs::srv::Trigger>("/gripper/attach");
+    auto detach_client = node->create_client<std_srvs::srv::Trigger>("/gripper/detach");
+
+    // Wait for services
+    RCLCPP_INFO(logger, "Waiting for Gazebo attach/detach services...");
+    while (!attach_client->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
+        RCLCPP_INFO(logger, "Gazebo attach service not available, waiting...");
+    }
+    while (!detach_client->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
+        RCLCPP_INFO(logger, "Gazebo detach service not available, waiting...");
+    }
+    RCLCPP_INFO(logger, "Gazebo services ready!");
 
     std::thread spinner([&executor]() {
         executor.spin();
@@ -549,10 +566,27 @@ int main(int argc, char *argv[])
                     }
 
                     if (group_name == "gripper") {
-                        // DETACH CUBE BEFORE OPENING GRIPPER AT PLACE LOCATION
                         if (stage_name == "open gripper place") {
                             RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
                             arm_group.detachObject("red_cube");
+                            
+                            // DETACH IN GAZEBO
+                            RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
+                            auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                            auto detach_future = detach_client->async_send_request(detach_req);
+                            
+                            auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
+                            if (detach_status == std::future_status::ready) {
+                                auto detach_res = detach_future.get();
+                                if (detach_res->success) {
+                                    RCLCPP_INFO(logger, "Cube detached from Gazebo: %s", detach_res->message.c_str());
+                                } else {
+                                    RCLCPP_ERROR(logger, "Failed to detach in Gazebo: %s", detach_res->message.c_str());
+                                }
+                            } else {
+                                RCLCPP_ERROR(logger, "Gazebo detach service timeout!");
+                            }
+                            rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
                         gripper_group.execute(plan);
                     } else {
@@ -560,10 +594,28 @@ int main(int argc, char *argv[])
                             RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
                             bool attached = arm_group.attachObject("red_cube", "gripper", touch_links);
                             if (attached) {
-                                RCLCPP_INFO(logger, "Cube attached successfully!");
+                                RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
                             } else {
-                                RCLCPP_ERROR(logger, "Cube FAILED to attach!");
+                                RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
                             }
+                            
+                            // ATTACH IN GAZEBO
+                            RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
+                            auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                            auto attach_future = attach_client->async_send_request(attach_req);
+                            
+                            auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
+                            if (attach_status == std::future_status::ready) {
+                                auto attach_res = attach_future.get();
+                                if (attach_res->success) {
+                                    RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
+                                } else {
+                                    RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
+                                }
+                            } else {
+                                RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
+                            }
+                            rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
                         arm_group.execute(plan);
                     }
@@ -588,6 +640,24 @@ int main(int argc, char *argv[])
                         if (stage_name == "open gripper place") {
                             RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
                             arm_group.detachObject("red_cube");
+                            
+                            // DETACH IN GAZEBO
+                            RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
+                            auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                            auto detach_future = detach_client->async_send_request(detach_req);
+                            
+                            auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
+                            if (detach_status == std::future_status::ready) {
+                                auto detach_res = detach_future.get();
+                                if (detach_res->success) {
+                                    RCLCPP_INFO(logger, "Cube detached from Gazebo: %s", detach_res->message.c_str());
+                                } else {
+                                    RCLCPP_ERROR(logger, "Failed to detach in Gazebo: %s", detach_res->message.c_str());
+                                }
+                            } else {
+                                RCLCPP_ERROR(logger, "Gazebo detach service timeout!");
+                            }
+                            rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
                         gripper_group.execute(plan);
                     } else {
@@ -595,10 +665,28 @@ int main(int argc, char *argv[])
                             RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
                             bool attached = arm_group.attachObject("red_cube", "gripper", touch_links);
                             if (attached) {
-                                RCLCPP_INFO(logger, "Cube attached successfully!");
+                                RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
                             } else {
-                                RCLCPP_ERROR(logger, "Cube FAILED to attach!");
+                                RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
                             }
+                            
+                            // ATTACH IN GAZEBO
+                            RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
+                            auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                            auto attach_future = attach_client->async_send_request(attach_req);
+                            
+                            auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
+                            if (attach_status == std::future_status::ready) {
+                                auto attach_res = attach_future.get();
+                                if (attach_res->success) {
+                                    RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
+                                } else {
+                                    RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
+                                }
+                            } else {
+                                RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
+                            }
+                            rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
                         arm_group.execute(plan);
                     }

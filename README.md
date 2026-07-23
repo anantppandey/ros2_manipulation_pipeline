@@ -118,3 +118,6 @@ Implementation Notes: Grasping and Object Attachment
 Grasp Sequence & Collision Handling: Added descent, close-gripper, and lift stages using pre-calculated 5-DOF IK targets. Expanded the allowCollisions stage to include both arm and gripper links, preventing OMPL from aborting when the gripper contacted the cube.
 Manual Object Attachment: Because we bypassed MTC's internal execution server, MTC's attachObject stage didn't reach the real move_group node. We fixed this by intercepting the "lift up" trajectory in our execution loop and manually calling arm_group.attachObject() to synchronize the real MoveIt planning scene, ensuring the cube's collision geometry moved with the gripper.
 Decoupled Offsets: Split the RViz cube pose offsets from the Gazebo gripper target offsets to independently tune visual accuracy and physical grasp alignment.
+
+
+CLEARER EXPLAINATION OF CUSTOM PLUGIN NEEDED
