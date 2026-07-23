@@ -34,6 +34,7 @@
 
 
 #include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/empty.hpp>
 
 namespace mtc = moveit::task_constructor;
 
@@ -193,6 +194,9 @@ int main(int argc, char *argv[])
     double DESCEND_DISTANCE = 0.05; 
     double LIFT_DISTANCE = 0.10;    
 
+    double PLACE_APPROACH_CLEARANCE = 0.13;  // TUNE: height above lift_z needed to clear the wall at the place x/y — verify in RViz first
+    double PLACE_DESCEND_DISTANCE = 0.08;    // TUNE: how far to lower onto the place surface once clear of the wall
+
     // ==========================================
     // 1. INITIALIZE TASK AND ROBOT MODEL
     // ==========================================
@@ -226,6 +230,36 @@ int main(int argc, char *argv[])
         rclcpp::shutdown();
         return 1;
     }
+
+
+    // NEW: this monitor is what actually syncs world geometry (incl. octomap) from move_group
+    auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node, "robot_description");
+    psm->startSceneMonitor();
+    psm->startWorldGeometryMonitor();   // <-- this is the one that carries octomap updates
+    psm->startStateMonitor();
+
+    // Force-clear any stale occupied voxels left from earlier testing (e.g. before the
+    // padding was widened). Octomap cells only clear when re-observed as free by a sensor
+    // ray, so old bad voxels can persist across mtc_node restarts even if move_group didn't restart.
+    auto clear_octomap_client = node->create_client<std_srvs::srv::Empty>("/clear_octomap");
+    RCLCPP_INFO(logger, "Waiting for /clear_octomap service...");
+    if (clear_octomap_client->wait_for_service(std::chrono::seconds(3))) {
+        auto clear_req = std::make_shared<std_srvs::srv::Empty::Request>();
+        auto clear_future = clear_octomap_client->async_send_request(clear_req);
+        if (clear_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+            RCLCPP_INFO(logger, "Octomap cleared.");
+        } else {
+            RCLCPP_WARN(logger, "/clear_octomap call timed out, continuing anyway.");
+        }
+    } else {
+        RCLCPP_WARN(logger, "/clear_octomap service not available, skipping clear.");
+    }
+
+    // Let the sensors rebuild the octomap cleanly (with current padding) before syncing.
+    rclcpp::sleep_for(std::chrono::seconds(3));
+
+    psm->requestPlanningSceneState("/get_planning_scene"); // blocking one-shot sync, don't start empty
+
 
     Eigen::Isometry3d debug_sp = current_state->getGlobalLinkTransform("shoulder_pan");
     RCLCPP_INFO(logger, "Shoulder Pan is at: x=%f, y=%f, z=%f", 
@@ -337,10 +371,20 @@ int main(int argc, char *argv[])
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
-    // Compute Place Pose IK (-0.15, 0.3, same height as lift)
+    // Compute Place APPROACH Pose IK (-0.15, 0.3, high enough to clear the wall)
     double place_x = -0.15;
     double place_y = 0.3-0.025;
-    double place_z = lift_z; // Maintain the same gripper height
+    double place_approach_z = lift_z + PLACE_APPROACH_CLEARANCE;
+
+    std::vector<double> place_approach_joint_values;
+    if (!computeArmIKToTarget(current_state.get(), logger, 
+                              place_x, place_y, place_approach_z, 
+                              place_approach_joint_values)) {
+        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
+    }
+
+    // Compute final Place Pose IK (lower onto the surface once clear of the wall)
+    double place_z = place_approach_z - PLACE_DESCEND_DISTANCE;
 
     std::vector<double> place_joint_values;
     if (!computeArmIKToTarget(current_state.get(), logger, 
@@ -366,7 +410,16 @@ int main(int argc, char *argv[])
     gripper_pipeline->setMaxAccelerationScalingFactor(0.1);
 
     // Stage 1: Fixed Current State
-    auto scene = std::make_shared<planning_scene::PlanningScene>(robot_model);
+    planning_scene::PlanningScenePtr scene;
+    {
+        planning_scene_monitor::LockedPlanningSceneRO locked_scene(psm);
+        scene = locked_scene->diff();   // inherits world geometry, incl. octomap, from the live scene
+    }
+
+    RCLCPP_INFO(logger, "Scene world objects: %zu | has octomap: %s",
+        scene->getWorld()->size(),
+        scene->getWorld()->hasObject(planning_scene::PlanningScene::OCTOMAP_NS) ? "yes" : "no");
+
     moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
     scene_state = *current_state;
     
@@ -423,6 +476,14 @@ int main(int argc, char *argv[])
     open_gripper->setProperty("timeout", 5.0);
     task.add(std::move(open_gripper));
 
+    // Stage 4.5: Allow collision with octomap voxels local to the grasp (cube self-perception)
+    auto allow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper-octomap collision");
+    std::vector<std::string> octomap_allow_list = touch_links;
+    octomap_allow_list.push_back("red_cube");  // camera sees the cube too — same voxels as the object
+    allow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_allow_list, true);
+    task.add(std::move(allow_octomap_coll));
+
+
     // Stage 5: Descend to Cube (Joint Space)
     auto descend = std::make_unique<mtc::stages::MoveTo>("descend to cube", pipeline);
     descend->setGroup("arm");
@@ -465,11 +526,34 @@ int main(int argc, char *argv[])
     lift->setProperty("timeout", 10.0);
     task.add(std::move(lift));
 
+    // Stage 8.5: Re-disallow octomap collision now that we're clear of the pickup zone
+    auto disallow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("disallow gripper-octomap collision");
+    std::vector<std::string> octomap_disallow_list = touch_links;
+    octomap_disallow_list.push_back("red_cube");
+    disallow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_disallow_list, false);
+    task.add(std::move(disallow_octomap_coll));
+
     // ==========================================
-    // Stage 9: Move to Place Location
+    // Stage 9: Move to Place Location (approach height — clears the wall)
     // ==========================================
     auto move_to_place = std::make_unique<mtc::stages::MoveTo>("move to place", pipeline);
     move_to_place->setGroup("arm");
+    std::map<std::string, double> place_approach_targets;
+    for (size_t i = 0; i < joint_names.size(); ++i) {
+        place_approach_targets[joint_names[i]] = place_approach_joint_values[i];
+        if (joint_names[i] == "wrist_1_wrist_2_joint") {
+            place_approach_targets[joint_names[i]] += M_PI / 2.0;
+        }
+    }
+    move_to_place->setGoal(place_approach_targets); 
+    move_to_place->setProperty("timeout", 10.0);
+    task.add(std::move(move_to_place));
+
+    // ==========================================
+    // Stage 9.5: Descend to Place Surface (now clear of the wall)
+    // ==========================================
+    auto descend_to_place = std::make_unique<mtc::stages::MoveTo>("descend to place", pipeline);
+    descend_to_place->setGroup("arm");
     std::map<std::string, double> place_targets;
     for (size_t i = 0; i < joint_names.size(); ++i) {
         place_targets[joint_names[i]] = place_joint_values[i];
@@ -477,9 +561,9 @@ int main(int argc, char *argv[])
             place_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    move_to_place->setGoal(place_targets); 
-    move_to_place->setProperty("timeout", 10.0);
-    task.add(std::move(move_to_place));
+    descend_to_place->setGoal(place_targets); 
+    descend_to_place->setProperty("timeout", 10.0);
+    task.add(std::move(descend_to_place));
 
     // ==========================================
     // Stage 10: Open Gripper to Release

@@ -164,16 +164,16 @@
 
     <model name="static_obstacle_1">
       <static>true</static>
-      <pose>-0.075 0.325 0.075 0 0 0.0</pose>
+      <pose>-0.075 0.325 0.055 0 0 0.0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
-            <box><size>0.015 0.2 0.15</size></box>
+            <box><size>0.015 0.2 0.11</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box><size>0.015 0.2 0.15</size></box>
+            <box><size>0.015 0.2 0.11</size></box>
           </geometry>
           <!-- <material>
             <ambient>1 0 0 1</ambient>
