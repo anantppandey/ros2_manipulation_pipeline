@@ -1,17 +1,34 @@
-sensors: []
-# sensors: ["nerian_stereo"]
-# nerian_stereo:
-#   sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
-#   point_cloud_topic: /nerian_stereo/points
-#   sensor_frame: nerian_stereo_color_optical_frame
-#   target_frame: world
-#   max_range: 10.0
-#   point_subsample: 5
-#   octomap_resolution: 0.05
-#   max_update_rate: 5.0
-#   padding_offset: 0.15
-#   padding_scale: 1.7
-#   filtered_cloud_topic: "/nerian_stereo/points_filtered"
-#   queue_size: 1
-#   shadow_threshold: 0.0
-#   min_sensor_dist: 0.1
+sensors:
+  - overhead_camera
+  - front_camera
+
+overhead_camera:
+  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+
+  point_cloud_topic: /overhead_camera/points
+
+  max_range: 5.0
+  point_subsample: 1
+
+  padding_offset: 0.03
+  padding_scale: 1.0
+
+  max_update_rate: 10.0
+
+  filtered_cloud_topic: /overhead_camera/filtered_points
+
+
+front_camera:
+  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+
+  point_cloud_topic: /front_camera/points
+
+  max_range: 5.0
+  point_subsample: 1
+
+  padding_offset: 0.03
+  padding_scale: 1.0
+
+  max_update_rate: 10.0
+
+  filtered_cloud_topic: /front_camera/filtered_points

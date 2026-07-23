@@ -235,6 +235,17 @@ def generate_launch_description():
     #         publish_robot_description_semantic=True,
     #     )
 
+    octomap_updater_config = load_yaml(
+    "giraffe_moveit_config",
+    "config/sensors_3d.yaml"
+    )
+
+    octomap_config = {
+    "octomap_frame": "world",
+    "octomap_resolution": 0.02,
+    "max_range": 5.0,
+    }
+
     moveit_config = (
         MoveItConfigsBuilder("giraffe")
         .robot_description(file_path="config/giraffe.urdf.xacro")
@@ -254,6 +265,8 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
             {"use_sim_time": True},
+            octomap_config,
+            octomap_updater_config,
             {
                 # In ROS 2 Jazzy, capabilities must be passed as "capability_plugins"
                 "capability_plugins": [

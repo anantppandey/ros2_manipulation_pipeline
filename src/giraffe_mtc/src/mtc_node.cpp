@@ -240,20 +240,20 @@ int main(int argc, char *argv[])
     // ==========================================
     moveit::planning_interface::PlanningSceneInterface psi;
     moveit_msgs::msg::CollisionObject floor;
-    floor.id = "floor";
-    floor.header.frame_id = robot_model->getModelFrame();
-    floor.primitives.resize(1);
-    floor.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    floor.primitives[0].dimensions.resize(3);
-    floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 2.0;
-    floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 2.0;
-    floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.1;
-    floor.pose.position.x = 0.0;
-    floor.pose.position.y = 0.0;
-    floor.pose.position.z = -0.05; 
-    floor.pose.orientation.w = 1.0;
-    floor.operation = moveit_msgs::msg::CollisionObject::ADD;
-    psi.applyCollisionObject(floor);
+    // floor.id = "floor";
+    // floor.header.frame_id = robot_model->getModelFrame();
+    // floor.primitives.resize(1);
+    // floor.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
+    // floor.primitives[0].dimensions.resize(3);
+    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 2.0;
+    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 2.0;
+    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.1;
+    // floor.pose.position.x = 0.0;
+    // floor.pose.position.y = 0.0;
+    // floor.pose.position.z = -0.05; 
+    // floor.pose.orientation.w = 1.0;
+    // floor.operation = moveit_msgs::msg::CollisionObject::ADD;
+    // psi.applyCollisionObject(floor);
 
     // ==========================================
     // 4. WAIT FOR CUBE POSE
@@ -441,7 +441,7 @@ int main(int argc, char *argv[])
     auto close_gripper = std::make_unique<mtc::stages::MoveTo>("close gripper", gripper_pipeline);
     close_gripper->setGroup("gripper");
     std::map<std::string, double> gripper_close;
-    gripper_close["wrist_2_gripper_joint"] = 0.425; 
+    gripper_close["wrist_2_gripper_joint"] = 0.475; 
     close_gripper->setGoal(gripper_close);
     close_gripper->setProperty("timeout", 5.0);
     task.add(std::move(close_gripper));

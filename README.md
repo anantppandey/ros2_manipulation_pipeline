@@ -121,3 +121,10 @@ Decoupled Offsets: Split the RViz cube pose offsets from the Gazebo gripper targ
 
 
 CLEARER EXPLAINATION OF CUSTOM PLUGIN NEEDED
+
+Things I would like to add
+more custom stuff to the plugin
+Thread stuff
+
+
+* Added Octomap launch and fixed missing libs, fixed sensor_3d.yaml for both cameras, added obstcale wall to world, removed floore from mtc 

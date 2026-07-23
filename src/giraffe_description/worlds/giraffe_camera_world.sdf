@@ -55,13 +55,6 @@
           </inertia>
         </inertial>
       </link>
-
-      <!-- <plugin filename="gz-sim-detachable-joint-system" name="gz::sim::systems::DetachableJoint">
-        <parent_link>link</parent_link>
-        <child_model>giraffe</child_model>
-        <child_link>gripper</child_link>
-        <topic>/attach_cube</topic>
-      </plugin> -->
     </model>
 
     <model name="collection_box">
@@ -166,6 +159,27 @@
           </geometry>
         </visual>
 
+      </link>
+    </model>
+
+    <model name="static_obstacle_1">
+      <static>true</static>
+      <pose>-0.075 0.325 0.075 0 0 0.0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.015 0.2 0.15</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.015 0.2 0.15</size></box>
+          </geometry>
+          <!-- <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material> -->
+        </visual>
       </link>
     </model>
 
