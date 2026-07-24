@@ -129,4 +129,5 @@ Thread stuff
 
 * Added Octomap launch and fixed missing libs, fixed sensor_3d.yaml for both cameras, added obstcale wall to world, removed floore from mtc 
 * increased padding in sensor_3d.yaml so octomap voxel are not colliding with arm.
+* ## Added collision awarenes to code through octomap
 * Added two stages to the arm movement after cube pickup so it won't collide.
