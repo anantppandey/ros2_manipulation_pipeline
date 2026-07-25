@@ -120,7 +120,7 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
     kinematics::KinematicsQueryOptions options;
     options.return_approximate_solution = true;
 
-    const double max_pos_error = 0.015;
+    const double max_pos_error = 0.005;
     const double per_attempt_timeout = 0.3;
     const int max_attempts = 400;
     const double max_perturb_deg = 150.0;  // orientation is free, so allow a wide spread
