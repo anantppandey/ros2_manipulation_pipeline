@@ -230,16 +230,19 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 
 > The perception node currently runs standalone rather than being launched by `pick_place_mtc.launch.py` — see [Roadmap](#roadmap).
 
-## Roadmap
+## To-Do / Roadmap
 
 - Bundle the cube-detector node into the pick-and-place launch file for a single-command startup.
+- Add container detection and pose estimation as well.
+- Further set-dress the simulation world (additional obstacles, tray placement, etc.).
+- Add more coloured cubes and containers.
 - Extend the custom Gazebo plugin beyond simple attach/detach.
 - Revisit the execution architecture for better concurrency ("thread stuff").
-- Further set-dress the simulation world (additional obstacles, tray placement, etc.).
+
 
 ## Changelog
 
-The full chronological development log — including the perception/simulation setup, the MTC integration work, and every major fix — lives in [CHANGELOG.md](CHANGELOG.md).
+The full chronological development log — including the perception/simulation setup, the MTC integration work, and every major fix — lives in [CHANGELOG.md](docs/ChangeLog.md).
 
 ## License
 
