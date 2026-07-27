@@ -131,3 +131,15 @@ Thread stuff
 * increased padding in sensor_3d.yaml so octomap voxel are not colliding with arm.
 * ## Added collision awarenes to code through octomap
 * Added two stages to the arm movement after cube pickup so it won't collide.
+
+* Fix: orientation-correction IK now seeds from the reachable pose instead of the robot's starting pose
+
+Previously, the step that snaps the wrist to the canonical grasp/place orientation was solving IK from scratch, seeded from wherever the arm was sitting at the very start of the program — far from the actual target. This forced the solver to combine a full arm reach with an exact orientation match in one shot, which regularly required large, unpredictable orientation deviations (up to ~20°) to converge, throwing off the approach angle during descent.
+
+Now this step is seeded from the pose the preceding free-orientation search already found at that same position. Since the position is already solved, the orientation correction becomes a small local adjustment instead of a fresh global solve, converging closer to the intended orientation and with a much more predictable, repeatable approach.
+
+* Fix: stop execution immediately if any trajectory fails to run
+
+The execution loop was calling execute() for each stage without checking whether it actually succeeded. When one stage aborted mid-sequence (e.g. due to a start-state mismatch after a slow gripper action), the code kept sending every subsequent stage's trajectory anyway — each one planned on the assumption that the previous stage had actually moved the arm. This produced a cascade of aborted trajectories and left the arm in an unintended position.
+
+Execution now checks the result of every stage and halts the sequence the moment one fails, instead of pushing further stages on top of a robot state that no longer matches the plan.

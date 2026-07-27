@@ -15,7 +15,7 @@
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <mutex>
-#include <Eigen/Geometry> 
+#include <Eigen/Geometry>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -34,10 +34,10 @@
 #include <moveit/utils/moveit_error_code.hpp>
 #include <moveit/task_constructor/stages/modify_planning_scene.h>
 
-
 #include <std_srvs/srv/trigger.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <moveit/collision_detection/collision_common.h>
+#include <moveit/robot_state/robot_state.h>
 #include <random>
 
 namespace mtc = moveit::task_constructor;
@@ -54,45 +54,106 @@ void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 }
 
 // ==========================================
-// 5-DOF IK COMPUTATION FUNCTION
+// SHARED ORIENTATION HELPERS
 // ==========================================
-/**
- * @brief Compute IK joint values for a 5-DOF arm to reach a target gripper (x,y,z) pose.
- * 
- * @param current_state  Pointer to the current RobotState (used for FK + IK seed)
- * @param logger         ROS logger for info/error messages
- * @param x              Target Gripper X position (meters, world frame)
- * @param y              Target Gripper Y position (meters, world frame)
- * @param z              Target Gripper Z position (meters, world frame)
- * @param joint_values   [out] Resulting joint values for the "arm" group on success
- * 
- * @return true  if IK succeeded (joint_values filled)
- * @return false if IK failed
- */
-bool computeArmIKToTarget(moveit::core::RobotState* current_state,
-                          const planning_scene::PlanningSceneConstPtr& scene,
-                          rclcpp::Logger logger,
-                          double x, double y, double z,
-                          std::vector<double>& joint_values)
+double computeTargetWorldYaw(const Eigen::Vector3d& sp_translation, double x, double y)
 {
-    Eigen::Isometry3d sp_pose      = current_state->getGlobalLinkTransform("shoulder_pan");
-    Eigen::Isometry3d wrist_2_pose = current_state->getGlobalLinkTransform("wrist_2");
-    Eigen::Isometry3d gripper_pose = current_state->getGlobalLinkTransform("gripper");
+    double dx = x - sp_translation.x();
+    double dy = y - sp_translation.y();
+    return std::atan2(dy, dx);
+}
 
-    Eigen::Isometry3d w2_to_grip_tf  = wrist_2_pose.inverse() * gripper_pose;
-    Eigen::Vector3d   w2_to_grip_vec = w2_to_grip_tf.translation();
+/**
+ * @brief The "canonical" wrist orientation for facing a given (x,y) target: the ORIGINAL
+ * wrist orientation (captured once at startup, before any motion), yawed to face the
+ * target. This never depends on where the arm currently is — it's always anchored to the
+ * same initial reference — so every fixed-orientation move for the same target column
+ * (pre-grasp/descend/lift, or place-approach/descend) computes the exact same answer.
+ */
+Eigen::Quaterniond computeDesiredWristOrientation(const Eigen::Isometry3d& initial_sp_pose,
+                                                   const Eigen::Isometry3d& initial_wrist2_pose,
+                                                   double x, double y)
+{
+    double target_world_yaw = computeTargetWorldYaw(initial_sp_pose.translation(), x, y);
+    Eigen::Matrix3d m = initial_sp_pose.rotation();
+    double initial_base_yaw = std::atan2(m(1, 0), m(0, 0));
+    double delta_yaw = target_world_yaw - initial_base_yaw;
 
-    const moveit::core::JointModelGroup* jmg = current_state->getJointModelGroup("arm");
+    Eigen::AngleAxisd rot_z(delta_yaw, Eigen::Vector3d::UnitZ());
+    Eigen::Quaterniond desired_q(rot_z * initial_wrist2_pose.rotation());
+    desired_q.normalize();
+    return desired_q;
+}
+
+void logIKFailureDiagnosis(moveit::core::RobotState* seed_state,
+                            const planning_scene::PlanningSceneConstPtr& scene,
+                            rclcpp::Logger logger,
+                            const geometry_msgs::msg::Pose& nominal_wrist2_pose,
+                            double x, double y, double z)
+{
+    const moveit::core::JointModelGroup* jmg = seed_state->getJointModelGroup("arm");
+    moveit::core::RobotState debug_state(*seed_state);
+    kinematics::KinematicsQueryOptions debug_options;
+    debug_options.return_approximate_solution = true;
+
+    if (debug_state.setFromIK(jmg, nominal_wrist2_pose, "wrist_2", 0.2,
+                              moveit::core::GroupStateValidityCallbackFn(), debug_options)) {
+        collision_detection::CollisionRequest debug_req;
+        debug_req.contacts = true;
+        debug_req.max_contacts = 20;
+        collision_detection::CollisionResult debug_res;
+        scene->checkCollision(debug_req, debug_res, debug_state);
+        if (debug_res.collision) {
+            RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f): blocked by collision. Contacts:", x, y, z);
+            for (const auto& c : debug_res.contacts) {
+                RCLCPP_ERROR(logger, "  %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
+            }
+        } else {
+            Eigen::Isometry3d achieved = debug_state.getGlobalLinkTransform("wrist_2");
+            double pos_error = (achieved.translation() -
+                                 Eigen::Vector3d(nominal_wrist2_pose.position.x,
+                                                 nominal_wrist2_pose.position.y,
+                                                 nominal_wrist2_pose.position.z)).norm();
+            RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f): collision-free, IK converges to %.1fmm error — above max_pos_error, not a collision or seeding issue.",
+                         x, y, z, pos_error * 1000.0);
+        }
+    } else {
+        RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f) not kinematically reachable (checked ignoring collision).", x, y, z);
+    }
+}
+
+// ==========================================
+// FREE-ORIENTATION IK — for large Cartesian relocations (pre-grasp, place-approach).
+// Wrist orientation is searched freely; whatever it lands on is returned via
+// achieved_orientation for the caller (not currently consumed downstream, but kept
+// for anyone who wants to inspect/log what orientation was actually used).
+//
+// IMPORTANT: seed_state must always be the PRISTINE current_state, never a state
+// mutated by a previous IK call. Chaining IK results as seeds caused this solver's
+// random full-joint search (setToRandomPositions touches ALL 5 joints, not just
+// orientation) to leave joints 2-5 in an arbitrary configuration, which then made
+// computeFixedOrientationIK's seed correction impossible to converge from — it was
+// starting in the wrong basin entirely, no amount of jitter/attempts could fix that.
+// ==========================================
+bool computeFreeOrientationIK(moveit::core::RobotState* seed_state,
+                               const planning_scene::PlanningSceneConstPtr& scene,
+                               rclcpp::Logger logger,
+                               double x, double y, double z,
+                               std::vector<double>& joint_values,
+                               Eigen::Quaterniond& achieved_orientation)
+{
+    Eigen::Isometry3d wrist_2_pose = seed_state->getGlobalLinkTransform("wrist_2");
+    Eigen::Isometry3d gripper_pose = seed_state->getGlobalLinkTransform("gripper");
+    Eigen::Vector3d w2_to_grip_vec = (wrist_2_pose.inverse() * gripper_pose).translation();
+
+    const moveit::core::JointModelGroup* jmg = seed_state->getJointModelGroup("arm");
     const std::vector<std::string>& joint_names = jmg->getVariableNames();
 
-    // Still useful as a warm-start guess for joint_1 (speeds up convergence),
-    // even though we no longer force the final orientation to match this yaw.
-    double dx = x - sp_pose.translation().x();
-    double dy = y - sp_pose.translation().y();
-    double target_world_yaw = std::atan2(dy, dx);
+    double target_world_yaw = computeTargetWorldYaw(
+        seed_state->getGlobalLinkTransform("shoulder_pan").translation(), x, y);
 
     std::vector<double> seed_joints;
-    current_state->copyJointGroupPositions("arm", seed_joints);
+    seed_state->copyJointGroupPositions("arm", seed_joints);
     for (size_t i = 0; i < joint_names.size(); ++i) {
         if (joint_names[i] == "base_link_shoulder_pan_joint") {
             double joint_1_target = target_world_yaw - 1.5708;
@@ -120,7 +181,7 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
     kinematics::KinematicsQueryOptions options;
     options.return_approximate_solution = true;
 
-    const double max_pos_error = 0.005;
+    const double max_pos_error = 0.015;
     const double per_attempt_timeout = 0.3;
     const int max_attempts = 400;
     const double max_perturb_deg = 150.0;  // orientation is free, so allow a wide spread
@@ -130,7 +191,9 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
     std::normal_distribution<double> gauss(0.0, 1.0);
     std::uniform_real_distribution<double> angle_dist(0.0, max_perturb_deg * M_PI / 180.0);
 
-    RCLCPP_INFO(logger, "Computing position-priority IK for (%.3f, %.3f, %.3f)...", x, y, z);
+    RCLCPP_INFO(logger, "Free-orientation IK for (%.3f, %.3f, %.3f)...", x, y, z);
+
+    geometry_msgs::msg::Pose last_nominal_pose;
 
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         // Attempt 0: try the arm's natural current orientation, unperturbed.
@@ -143,8 +206,7 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
         Eigen::Quaterniond target_q(perturb * wrist_2_pose.rotation());
         target_q.normalize();
 
-        Eigen::Vector3d target_gripper_pos(x, y, z);
-        Eigen::Vector3d target_pos = target_gripper_pos - (target_q * w2_to_grip_vec);
+        Eigen::Vector3d target_pos = Eigen::Vector3d(x, y, z) - (target_q * w2_to_grip_vec);
 
         geometry_msgs::msg::Pose target_wrist_2;
         target_wrist_2.position.x = target_pos.x();
@@ -154,8 +216,9 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
         target_wrist_2.orientation.y = target_q.y();
         target_wrist_2.orientation.z = target_q.z();
         target_wrist_2.orientation.w = target_q.w();
+        if (attempt == 0) last_nominal_pose = target_wrist_2;
 
-        moveit::core::RobotState attempt_state(*current_state);
+        moveit::core::RobotState attempt_state(*seed_state);
         if (attempt == 0) {
             attempt_state.setJointGroupPositions("arm", seed_joints);
         } else {
@@ -165,61 +228,210 @@ bool computeArmIKToTarget(moveit::core::RobotState* current_state,
         if (attempt_state.setFromIK(jmg, target_wrist_2, "wrist_2",
                                      per_attempt_timeout, constraint, options)) {
             Eigen::Isometry3d achieved = attempt_state.getGlobalLinkTransform("wrist_2");
-            double pos_error = (achieved.translation() -
-                                 Eigen::Vector3d(target_wrist_2.position.x,
-                                                 target_wrist_2.position.y,
-                                                 target_wrist_2.position.z)).norm();
+            double pos_error = (achieved.translation() - target_pos).norm();
             if (pos_error > max_pos_error) continue;
 
             attempt_state.copyJointGroupPositions("arm", joint_values);
-            RCLCPP_INFO(logger, "IK found for (%.3f, %.3f, %.3f) on attempt %d, error %.1fmm",
+            achieved_orientation = Eigen::Quaterniond(achieved.rotation());
+            RCLCPP_INFO(logger, "Free IK found for (%.3f, %.3f, %.3f) on attempt %d, error %.1fmm",
                         x, y, z, attempt + 1, pos_error * 1000.0);
             return true;
         }
     }
 
-    // None of the attempts succeeded — find out exactly why, instead of guessing again.
+    logIKFailureDiagnosis(seed_state, scene, logger, last_nominal_pose, x, y, z);
+    RCLCPP_ERROR(logger, "Free-orientation IK failed for (%.3f, %.3f, %.3f) after %d attempts.",
+                 x, y, z, max_attempts);
+    return false;
+}
+
+// ==========================================
+// FIXED-ORIENTATION IK — for short vertical motions (descend, lift). Orientation is
+// held as close as possible to desired_orientation.
+//
+// IMPORTANT: seed_state must always be the PRISTINE current_state (same rule as
+// above). This function internally re-derives the yaw-corrected joint_1 from
+// seed_state — the same relationship computeDesiredWristOrientation was built
+// around — so it always starts from the right basin regardless of which caller
+// invokes it. It does NOT rely on inheriting a good joint_1 from a prior call.
+//
+// A 5-DOF arm generically cannot satisfy an arbitrary (position, EXACT orientation)
+// pair — that's 6 constraints from 5 joints. At some (x,y) columns the desired
+// orientation has a genuine structural residual (not a seeding problem — jittering
+// the seed doesn't help, because the gap isn't due to a bad local minimum, it's
+// because the constraint set is over-determined at that point). achieved_orientation
+// reports back exactly what orientation was used: equal to desired_orientation in
+// the normal case, or a small bounded deviation from it if the relaxed fallback
+// tier below had to kick in. Callers doing multiple fixed-orientation moves along
+// the same (x,y) column should feed each call's achieved_orientation into the next
+// call's desired_orientation, so the whole column stays internally consistent
+// instead of each stage separately fighting the same infeasibility.
+// ==========================================
+bool computeFixedOrientationIK(moveit::core::RobotState* seed_state,
+                                const planning_scene::PlanningSceneConstPtr& scene,
+                                rclcpp::Logger logger,
+                                double x, double y, double z,
+                                const Eigen::Quaterniond& desired_orientation,
+                                std::vector<double>& joint_values,
+                                Eigen::Quaterniond& achieved_orientation)
+{
+    Eigen::Isometry3d wrist_2_pose = seed_state->getGlobalLinkTransform("wrist_2");
+    Eigen::Isometry3d gripper_pose = seed_state->getGlobalLinkTransform("gripper");
+    Eigen::Vector3d w2_to_grip_vec = (wrist_2_pose.inverse() * gripper_pose).translation();
+
+    const moveit::core::JointModelGroup* jmg = seed_state->getJointModelGroup("arm");
+    const std::vector<std::string>& joint_names = jmg->getVariableNames();
+
+    Eigen::Quaterniond target_q = desired_orientation.normalized();
+    Eigen::Vector3d target_pos = Eigen::Vector3d(x, y, z) - (target_q * w2_to_grip_vec);
+
+    geometry_msgs::msg::Pose target_wrist_2;
+    target_wrist_2.position.x = target_pos.x();
+    target_wrist_2.position.y = target_pos.y();
+    target_wrist_2.position.z = target_pos.z();
+    target_wrist_2.orientation.x = target_q.x();
+    target_wrist_2.orientation.y = target_q.y();
+    target_wrist_2.orientation.z = target_q.z();
+    target_wrist_2.orientation.w = target_q.w();
+
+    double target_world_yaw = computeTargetWorldYaw(
+        seed_state->getGlobalLinkTransform("shoulder_pan").translation(), x, y);
+
+    // Re-derive joint_1 from the PRISTINE seed_state's own shoulder_pan pose — this
+    // is what makes this function safe to call with any (x,y), from any caller,
+    // without depending on what a previous IK call left behind.
+    moveit::core::RobotState corrected_seed(*seed_state);
     {
-        Eigen::Quaterniond nominal_q(wrist_2_pose.rotation());
-        Eigen::Vector3d target_gripper_pos(x, y, z);
-        Eigen::Vector3d target_pos = target_gripper_pos - (nominal_q * w2_to_grip_vec);
-
-        geometry_msgs::msg::Pose debug_pose;
-        debug_pose.position.x = target_pos.x();
-        debug_pose.position.y = target_pos.y();
-        debug_pose.position.z = target_pos.z();
-        debug_pose.orientation.x = nominal_q.x();
-        debug_pose.orientation.y = nominal_q.y();
-        debug_pose.orientation.z = nominal_q.z();
-        debug_pose.orientation.w = nominal_q.w();
-
-        moveit::core::RobotState debug_state(*current_state);
-        debug_state.setJointGroupPositions("arm", seed_joints);
-        kinematics::KinematicsQueryOptions debug_options;
-        debug_options.return_approximate_solution = true;
-
-        if (debug_state.setFromIK(jmg, debug_pose, "wrist_2", 0.2,
-                                  moveit::core::GroupStateValidityCallbackFn(), debug_options)) {
-            collision_detection::CollisionRequest debug_req;
-            debug_req.contacts = true;
-            debug_req.max_contacts = 20;
-            collision_detection::CollisionResult debug_res;
-            scene->checkCollision(debug_req, debug_res, debug_state);
-            if (debug_res.collision) {
-                RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f): blocked by collision. Contacts:", x, y, z);
-                for (const auto& c : debug_res.contacts) {
-                    RCLCPP_ERROR(logger, "  %s <-> %s", c.first.first.c_str(), c.first.second.c_str());
-                }
-            } else {
-                RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f): reachable and collision-free at nominal orientation — the random search just never landed under the position-error threshold. Try raising max_attempts or max_pos_error.", x, y, z);
+        std::vector<double> corrected_joints;
+        corrected_seed.copyJointGroupPositions("arm", corrected_joints);
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            if (joint_names[i] == "base_link_shoulder_pan_joint") {
+                double joint_1_target = target_world_yaw - 1.5708;
+                while (joint_1_target >  M_PI) joint_1_target -= 2 * M_PI;
+                while (joint_1_target < -M_PI) joint_1_target += 2 * M_PI;
+                corrected_joints[i] = joint_1_target;
+                break;
             }
-        } else {
-            RCLCPP_ERROR(logger, "Pose (%.3f, %.3f, %.3f) can't be reached kinematically even at the nominal orientation, ignoring collision entirely.", x, y, z);
+        }
+        corrected_seed.setJointGroupPositions("arm", corrected_joints);
+        corrected_seed.update();
+    }
+
+    moveit::core::GroupStateValidityCallbackFn constraint =
+        [&scene](moveit::core::RobotState* state,
+                 const moveit::core::JointModelGroup* jmg2,
+                 const double* joint_group_variable_values) -> bool
+    {
+        state->setJointGroupPositions(jmg2, joint_group_variable_values);
+        state->update();
+        collision_detection::CollisionRequest req;
+        req.group_name = jmg2->getName();
+        collision_detection::CollisionResult res;
+        scene->checkCollision(req, res, *state, scene->getAllowedCollisionMatrix());
+        return !res.collision;
+    };
+
+    kinematics::KinematicsQueryOptions options;
+    options.return_approximate_solution = true;
+
+    // 15mm to match Free-Orientation IK's proven threshold — the numeric solver's
+    // achievable accuracy is a few mm regardless of which IK call makes it. Cube is
+    // 3cm and existing hand-tuned offsets already carry several mm of slack, so this
+    // doesn't meaningfully change grasp reliability.
+    const double max_pos_error = 0.015;
+    const int per_tier_attempts = 10;
+    const double per_attempt_timeout = 0.3;
+    // Escalating jitter radii around the yaw-corrected seed. Stays a genuinely LOCAL
+    // search the whole time — nothing like Free IK's 150° random restarts — just enough
+    // to recover from small numerical local minima around the corrected seed.
+    const double jitter_tiers[] = {0.0, 0.05, 0.15};
+
+    RCLCPP_INFO(logger, "Fixed-orientation IK for (%.3f, %.3f, %.3f)...", x, y, z);
+
+    int attempt_count = 0;
+    for (double jitter : jitter_tiers) {
+        // jitter=0.0 is a deterministic seed — one attempt tells you everything
+        // repeating it would; only the jittered tiers benefit from multiple tries.
+        int tier_attempts = (jitter == 0.0) ? 1 : per_tier_attempts;
+        for (int i = 0; i < tier_attempts; ++i, ++attempt_count) {
+            moveit::core::RobotState attempt_state(corrected_seed);
+            if (jitter > 0.0) {
+                attempt_state.setToRandomPositionsNearBy(jmg, corrected_seed, jitter);
+            }
+
+            if (attempt_state.setFromIK(jmg, target_wrist_2, "wrist_2",
+                                         per_attempt_timeout, constraint, options)) {
+                Eigen::Isometry3d achieved = attempt_state.getGlobalLinkTransform("wrist_2");
+                double pos_error = (achieved.translation() - target_pos).norm();
+                if (pos_error > max_pos_error) continue;
+
+                attempt_state.copyJointGroupPositions("arm", joint_values);
+                achieved_orientation = target_q;  // exact desired orientation was reachable here
+                RCLCPP_INFO(logger, "Fixed IK found for (%.3f, %.3f, %.3f) on attempt %d (jitter=%.2f), error %.1fmm",
+                            x, y, z, attempt_count + 1, jitter, pos_error * 1000.0);
+                return true;
+            }
         }
     }
 
-    RCLCPP_ERROR(logger, "No collision-free, accurate IK found for (%.3f, %.3f, %.3f) after %d attempts.",
-                 x, y, z, max_attempts);
+    // Last resort: the exact desired orientation has a structural residual at this
+    // (x,y) column for this 5-DOF arm — jittering the seed above couldn't fix it
+    // because the problem isn't the seed, it's that 5 joints can't hit an arbitrary
+    // (position, exact orientation) pair. Let orientation drift a SMALL bounded
+    // amount (much narrower than Free-Orientation IK's 150°) to close the gap, and
+    // report whatever orientation that ended up being.
+    {
+        const double relaxed_max_perturb_deg = 25.0;
+        const int relaxed_attempts = 150;
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::normal_distribution<double> gauss(0.0, 1.0);
+        std::uniform_real_distribution<double> angle_dist(0.0, relaxed_max_perturb_deg * M_PI / 180.0);
+
+        RCLCPP_WARN(logger, "Fixed-orientation IK: exact orientation infeasible within %.1fmm at (%.3f, %.3f, %.3f). Trying a bounded (+/-%.0f deg) orientation relaxation...",
+                    max_pos_error * 1000.0, x, y, z, relaxed_max_perturb_deg);
+
+        for (int i = 0; i < relaxed_attempts; ++i, ++attempt_count) {
+            double angle = angle_dist(gen);
+            Eigen::Vector3d axis(gauss(gen), gauss(gen), gauss(gen));
+            axis.normalize();
+            Eigen::AngleAxisd perturb(angle, axis);
+            Eigen::Quaterniond relaxed_q(perturb * target_q);
+            relaxed_q.normalize();
+
+            Eigen::Vector3d relaxed_target_pos = Eigen::Vector3d(x, y, z) - (relaxed_q * w2_to_grip_vec);
+            geometry_msgs::msg::Pose relaxed_wrist_2;
+            relaxed_wrist_2.position.x = relaxed_target_pos.x();
+            relaxed_wrist_2.position.y = relaxed_target_pos.y();
+            relaxed_wrist_2.position.z = relaxed_target_pos.z();
+            relaxed_wrist_2.orientation.x = relaxed_q.x();
+            relaxed_wrist_2.orientation.y = relaxed_q.y();
+            relaxed_wrist_2.orientation.z = relaxed_q.z();
+            relaxed_wrist_2.orientation.w = relaxed_q.w();
+
+            moveit::core::RobotState attempt_state(corrected_seed);
+            attempt_state.setToRandomPositions(jmg);
+
+            if (attempt_state.setFromIK(jmg, relaxed_wrist_2, "wrist_2",
+                                         per_attempt_timeout, constraint, options)) {
+                Eigen::Isometry3d achieved = attempt_state.getGlobalLinkTransform("wrist_2");
+                double pos_error = (achieved.translation() - relaxed_target_pos).norm();
+                if (pos_error > max_pos_error) continue;
+
+                attempt_state.copyJointGroupPositions("arm", joint_values);
+                achieved_orientation = Eigen::Quaterniond(achieved.rotation());
+                double deviation_deg = Eigen::AngleAxisd(target_q.inverse() * achieved_orientation).angle() * 180.0 / M_PI;
+                RCLCPP_INFO(logger, "Fixed IK found for (%.3f, %.3f, %.3f) via relaxed orientation (attempt %d, %.1f deg off nominal), error %.1fmm",
+                            x, y, z, i + 1, deviation_deg, pos_error * 1000.0);
+                return true;
+            }
+        }
+    }
+
+    logIKFailureDiagnosis(&corrected_seed, scene, logger, target_wrist_2, x, y, z);
+    RCLCPP_ERROR(logger, "Fixed-orientation IK failed for (%.3f, %.3f, %.3f) after %d attempts (including relaxed-orientation fallback).",
+                 x, y, z, attempt_count);
     return false;
 }
 
@@ -264,19 +476,19 @@ int main(int argc, char *argv[])
     // ==========================================
     // TWEAK THESE VALUES FOR TRIAL AND ERROR
     // ==========================================
-    double CUBE_X_OFFSET = -0.005;     
-    double CUBE_Y_OFFSET = 0.0;     
-    double CUBE_Z_OFFSET = -0.055;     
+    double CUBE_X_OFFSET = -0.005;
+    double CUBE_Y_OFFSET = 0.0;
+    double CUBE_Z_OFFSET = -0.055;
 
-    double GRIPPER_X_OFFSET = -0.031; 
+    double GRIPPER_X_OFFSET = -0.0;
     double GRIPPER_Y_OFFSET = -0.0275;
-    double GRIPPER_Z_OFFSET = 0.0275;  
+    double GRIPPER_Z_OFFSET = 0.0275;
 
-    double DESCEND_DISTANCE = 0.05; 
-    double LIFT_DISTANCE = 0.10;    
+    double DESCEND_DISTANCE = 0.05;
+    double LIFT_DISTANCE = 0.10;
 
-    double PLACE_APPROACH_CLEARANCE = 0.095;  // TUNE: height above lift_z needed to clear the wall at the place x/y — verify in RViz first
-    double PLACE_DESCEND_DISTANCE = 0.08;    // TUNE: how far to lower onto the place surface once clear of the wall
+    double PLACE_APPROACH_CLEARANCE = 0.08;  // TUNE: height above lift_z needed to clear the wall at the place x/y — verify in RViz first
+    double PLACE_DESCEND_DISTANCE = 0.08;     // TUNE: how far to lower onto the place surface once clear of the wall
 
     // ==========================================
     // 1. INITIALIZE TASK AND ROBOT MODEL
@@ -298,20 +510,24 @@ int main(int argc, char *argv[])
     auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
     auto monitor = std::make_shared<planning_scene_monitor::CurrentStateMonitor>(
         node, robot_model, tf_buffer, true);
-    
+
     rclcpp::sleep_for(std::chrono::seconds(3));
 
     RCLCPP_INFO(logger, "Waiting for robot state...");
     monitor->waitForCompleteState("arm", 5.0);
     monitor->waitForCompleteState("gripper", 5.0);
     moveit::core::RobotStatePtr current_state = monitor->getCurrentState();
-    
+
     if (!current_state) {
         RCLCPP_ERROR(logger, "Failed to get current robot state");
         rclcpp::shutdown();
         return 1;
     }
 
+    // Captured ONCE, before any motion — every desired (fixed) orientation is anchored
+    // to this, never to a later/mutated state.
+    Eigen::Isometry3d initial_sp_pose     = current_state->getGlobalLinkTransform("shoulder_pan");
+    Eigen::Isometry3d initial_wrist2_pose = current_state->getGlobalLinkTransform("wrist_2");
 
     // NEW: this monitor is what actually syncs world geometry (incl. octomap) from move_group
     auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node, "robot_description");
@@ -341,9 +557,8 @@ int main(int argc, char *argv[])
 
     psm->requestPlanningSceneState("/get_planning_scene"); // blocking one-shot sync, don't start empty
 
-
     Eigen::Isometry3d debug_sp = current_state->getGlobalLinkTransform("shoulder_pan");
-    RCLCPP_INFO(logger, "Shoulder Pan is at: x=%f, y=%f, z=%f", 
+    RCLCPP_INFO(logger, "Shoulder Pan is at: x=%f, y=%f, z=%f",
         debug_sp.translation().x(), debug_sp.translation().y(), debug_sp.translation().z());
 
     // CAPTURE THE EXACT STARTING JOINTS HERE
@@ -365,7 +580,7 @@ int main(int argc, char *argv[])
     // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.1;
     // floor.pose.position.x = 0.0;
     // floor.pose.position.y = 0.0;
-    // floor.pose.position.z = -0.05; 
+    // floor.pose.position.z = -0.05;
     // floor.pose.orientation.w = 1.0;
     // floor.operation = moveit_msgs::msg::CollisionObject::ADD;
     // psi.applyCollisionObject(floor);
@@ -382,10 +597,10 @@ int main(int argc, char *argv[])
 
     {
         std::lock_guard<std::mutex> lock(pose_mutex);
-        raw_pose = latest_pose; 
+        raw_pose = latest_pose;
     }
 
-    RCLCPP_INFO(logger, "Received Cube Pose -> x: %f, y: %f, z: %f", 
+    RCLCPP_INFO(logger, "Received Cube Pose -> x: %f, y: %f, z: %f",
         raw_pose.position.x, raw_pose.position.y, raw_pose.position.z);
 
     // ==========================================
@@ -405,7 +620,7 @@ int main(int argc, char *argv[])
     cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 0.03;
     cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 0.03;
     cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.03;
-    cube.pose = cube_pose; 
+    cube.pose = cube_pose;
     cube.operation = moveit_msgs::msg::CollisionObject::ADD;
     psi.applyCollisionObject(cube);
 
@@ -422,7 +637,7 @@ int main(int argc, char *argv[])
         planning_scene_monitor::LockedPlanningSceneRO locked_scene(psm);
         ik_scene = locked_scene->diff();
     }
-    ik_scene->processCollisionObjectMsg(cube);  
+    ik_scene->processCollisionObjectMsg(cube);
 
     planning_scene::PlanningScenePtr grasp_scene = ik_scene->diff();
     grasp_scene->getAllowedCollisionMatrixNonConst().setEntry("red_cube", touch_links, true);
@@ -437,84 +652,152 @@ int main(int argc, char *argv[])
     attached_cube_msg.touch_links = touch_links;
     transit_scene->processAttachedCollisionObjectMsg(attached_cube_msg);
 
-
     // ==========================================
     // APPLY OFFSET TO CUBE POSE FOR GRIPPER IK
     // ==========================================
     // Target represents where we want the GRIPPER to be
     geometry_msgs::msg::Pose target = raw_pose;
-    target.position.z += GRIPPER_Z_OFFSET; 
+    target.position.z += GRIPPER_Z_OFFSET;
     target.position.x += GRIPPER_X_OFFSET;
-    target.position.y += GRIPPER_Y_OFFSET; 
+    target.position.y += GRIPPER_Y_OFFSET;
 
     // ==========================================
     // 5-DOF IK CALCULATIONS
     // ==========================================
-    std::vector<double> joint_values;
-
+    // Every call below seeds from the pristine current_state — never from a previous
+    // IK result. This matches the very first working version's behavior exactly:
+    // each IK call independently re-derives joint_1 from current_state, so nothing
+    // downstream depends on the internal joint configuration a prior IK call landed on.
     auto world_obj = ik_scene->getWorld()->getObject(planning_scene::PlanningScene::OCTOMAP_NS);
     if (world_obj && !world_obj->shapes_.empty()) {
         auto octree_shape = std::dynamic_pointer_cast<const shapes::OcTree>(world_obj->shapes_[0]);
         if (octree_shape && octree_shape->octree) {
-            auto node = octree_shape->octree->search(target.position.x, target.position.y, target.position.z);
-            bool occupied = node && octree_shape->octree->isNodeOccupied(node);
+            auto oct_node = octree_shape->octree->search(target.position.x, target.position.y, target.position.z);
+            bool occupied = oct_node && octree_shape->octree->isNodeOccupied(oct_node);
             RCLCPP_INFO(logger, "Octomap synced OK. Target point (%.3f,%.3f,%.3f): %s",
                         target.position.x, target.position.y, target.position.z,
-                        occupied ? "OCCUPIED (padded wall likely reaches here)" : "free");
+                        occupied ? "OCCUPIED" : "free");
         }
     } else {
         RCLCPP_WARN(logger, "ik_scene has NO octomap object — requestPlanningSceneState didn't pull it in.");
     }
 
-    if (!computeArmIKToTarget(current_state.get(), ik_scene, logger, 
-                              target.position.x, target.position.y, target.position.z, 
-                              joint_values)) {
+    // --- PICK LEG ---
+
+    // 1. Free-orientation move to the pre-grasp pose.
+    std::vector<double> joint_values;
+    Eigen::Quaterniond achieved_grasp_orientation;
+    if (!computeFreeOrientationIK(current_state.get(), ik_scene, logger,
+                                   target.position.x, target.position.y, target.position.z,
+                                   joint_values, achieved_grasp_orientation)) {
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
-    // Compute Grasp Pose IK (Descend from target)
+    // 2. Fix orientation in place: same (x,y,z), snap back to the canonical
+    //    grasp-facing orientation. Seeded from Free-Orientation IK's OWN landed
+    //    state (same x,y,z) — position is already solved there, so this becomes a
+    //    local orientation correction instead of resolving the whole reach from
+    //    scratch against a far-away seed. computeFixedOrientationIK still
+    //    re-derives joint_1 internally regardless of what seed it's given, so this
+    //    doesn't reintroduce the earlier seed-contamination issue.
+    Eigen::Quaterniond desired_grasp_orientation =
+        computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose,
+                                        target.position.x, target.position.y);
+
+    moveit::core::RobotState free_grasp_state(*current_state);
+    free_grasp_state.setJointGroupPositions("arm", joint_values);
+    free_grasp_state.update();
+
+    std::vector<double> fix_orientation_grasp_joint_values;
+    Eigen::Quaterniond achieved_grasp_fixed_orientation;
+    if (!computeFixedOrientationIK(&free_grasp_state, ik_scene, logger,
+                                    target.position.x, target.position.y, target.position.z,
+                                    desired_grasp_orientation,
+                                    fix_orientation_grasp_joint_values,
+                                    achieved_grasp_fixed_orientation)) {
+        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
+    }
+
+    // 3. Descend to grasp — fixed orientation, vertical only. Reuses whatever
+    //    orientation was actually achieved just above (same x,y, only z differs) —
+    //    already proven reachable at this column — instead of re-deriving the
+    //    idealized analytic orientation, which may not be exactly reachable here.
     double grasp_x = target.position.x;
     double grasp_y = target.position.y;
     double grasp_z = target.position.z - DESCEND_DISTANCE;
-    
+
     std::vector<double> grasp_joint_values;
-    if (!computeArmIKToTarget(current_state.get(), grasp_scene, logger, 
-                              grasp_x, grasp_y, grasp_z, 
-                              grasp_joint_values)) {
+    Eigen::Quaterniond achieved_descend_orientation;
+    if (!computeFixedOrientationIK(current_state.get(), grasp_scene, logger,
+                                    grasp_x, grasp_y, grasp_z,
+                                    achieved_grasp_fixed_orientation,
+                                    grasp_joint_values,
+                                    achieved_descend_orientation)) {
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
-    // Compute Lift Pose IK (Lift from grasp)
+    // 4. Lift — fixed orientation, vertical only. Same reasoning: build on the
+    //    orientation just proven reachable at the grasp point.
     double lift_x = grasp_x;
     double lift_y = grasp_y;
     double lift_z = grasp_z + LIFT_DISTANCE;
 
     std::vector<double> lift_joint_values;
-    if (!computeArmIKToTarget(current_state.get(), transit_scene, logger, 
-                              lift_x, lift_y, lift_z, 
-                              lift_joint_values)) {
+    Eigen::Quaterniond achieved_lift_orientation;
+    if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
+                                    lift_x, lift_y, lift_z,
+                                    achieved_descend_orientation,
+                                    lift_joint_values,
+                                    achieved_lift_orientation)) {
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
-    // Compute Place APPROACH Pose IK (-0.15, 0.3, high enough to clear the wall)
-    double place_x = -0.15;
-    double place_y = 0.3-0.025;
+    // --- PLACE LEG ---
+
+    // 5. Free-orientation move to the place-approach pose.
+    double place_x = -0.13;
+    double place_y = 0.3 - 0.025;
     double place_approach_z = lift_z + PLACE_APPROACH_CLEARANCE;
 
     std::vector<double> place_approach_joint_values;
-    if (!computeArmIKToTarget(current_state.get(), transit_scene, logger, 
-                              place_x, place_y, place_approach_z, 
-                              place_approach_joint_values)) {
+    Eigen::Quaterniond achieved_place_orientation;
+    if (!computeFreeOrientationIK(current_state.get(), transit_scene, logger,
+                                   place_x, place_y, place_approach_z,
+                                   place_approach_joint_values, achieved_place_orientation)) {
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
-    // Compute final Place Pose IK (lower onto the surface once clear of the wall)
+    // 6. Fix orientation in place at the place-approach point. Same reasoning as
+    //    the grasp side: seed from Free-Orientation IK's own landed state so this
+    //    is a local orientation correction, not a from-scratch reach+orientation solve.
+    Eigen::Quaterniond desired_place_orientation =
+        computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose, place_x, place_y);
+
+    moveit::core::RobotState free_place_state(*current_state);
+    free_place_state.setJointGroupPositions("arm", place_approach_joint_values);
+    free_place_state.update();
+
+    std::vector<double> fix_orientation_place_joint_values;
+    Eigen::Quaterniond achieved_place_fixed_orientation;
+    if (!computeFixedOrientationIK(&free_place_state, transit_scene, logger,
+                                    place_x, place_y, place_approach_z,
+                                    desired_place_orientation,
+                                    fix_orientation_place_joint_values,
+                                    achieved_place_fixed_orientation)) {
+        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
+    }
+
+    // 7. Descend to place — fixed orientation, vertical only. Same column, so reuse
+    //    the orientation just proven reachable at the place-approach point.
     double place_z = place_approach_z - PLACE_DESCEND_DISTANCE;
 
     std::vector<double> place_joint_values;
-    if (!computeArmIKToTarget(current_state.get(), transit_scene, logger, 
-                              place_x, place_y, place_z, 
-                              place_joint_values)) {
+    Eigen::Quaterniond achieved_place_descend_orientation;
+    if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
+                                    place_x, place_y, place_z,
+                                    achieved_place_fixed_orientation,
+                                    place_joint_values,
+                                    achieved_place_descend_orientation)) {
         executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
     }
 
@@ -525,7 +808,7 @@ int main(int argc, char *argv[])
     // ==========================================
     // MOVEIT TASK CONSTRUCTOR SETUP
     // ==========================================
-    
+
     auto pipeline = std::make_shared<mtc::solvers::PipelinePlanner>(node);
     pipeline->setProperty("max_velocity_scaling_factor", 0.2);
     pipeline->setProperty("max_acceleration_scaling_factor", 0.2);
@@ -543,7 +826,7 @@ int main(int argc, char *argv[])
 
     moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
     scene_state = *current_state;
-    
+
     double safe_zero = 0.0;
     scene_state.setJointPositions("wrist_2_gripper_joint", &safe_zero);
     // cube already applied to ik_scene above — don't re-add it here
@@ -563,8 +846,8 @@ int main(int argc, char *argv[])
     auto rotate_wrist = std::make_unique<mtc::stages::MoveRelative>("rotate wrist", pipeline);
     rotate_wrist->setGroup("arm");
     std::map<std::string, double> joint_deltas;
-    joint_deltas["wrist_1_wrist_2_joint"] = M_PI / 2.0; 
-    rotate_wrist->setDirection(joint_deltas); 
+    joint_deltas["wrist_1_wrist_2_joint"] = M_PI / 2.0;
+    rotate_wrist->setDirection(joint_deltas);
     rotate_wrist->setProperty("timeout", 10.0);
     task.add(std::move(rotate_wrist));
 
@@ -578,15 +861,30 @@ int main(int argc, char *argv[])
             joint_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    move_to->setGoal(joint_targets); 
+    move_to->setGoal(joint_targets);
     move_to->setProperty("timeout", 10.0);
     task.add(std::move(move_to));
+
+    // Stage 3.5: Fix Orientation — snap the wrist back to the canonical grasp-facing
+    // orientation now that we're at the right position.
+    auto fix_orientation_grasp = std::make_unique<mtc::stages::MoveTo>("fix orientation (grasp)", pipeline);
+    fix_orientation_grasp->setGroup("arm");
+    std::map<std::string, double> fix_orientation_grasp_targets;
+    for (size_t i = 0; i < joint_names.size(); ++i) {
+        fix_orientation_grasp_targets[joint_names[i]] = fix_orientation_grasp_joint_values[i];
+        if (joint_names[i] == "wrist_1_wrist_2_joint") {
+            fix_orientation_grasp_targets[joint_names[i]] += M_PI / 2.0;
+        }
+    }
+    fix_orientation_grasp->setGoal(fix_orientation_grasp_targets);
+    fix_orientation_grasp->setProperty("timeout", 10.0);
+    task.add(std::move(fix_orientation_grasp));
 
     // Stage 2: Open Gripper
     auto open_gripper = std::make_unique<mtc::stages::MoveTo>("open gripper", gripper_pipeline);
     open_gripper->setGroup("gripper");
     std::map<std::string, double> gripper_open;
-    gripper_open["wrist_2_gripper_joint"] = 1.0; 
+    gripper_open["wrist_2_gripper_joint"] = 1.0;
     open_gripper->setGoal(gripper_open);
     open_gripper->setProperty("timeout", 5.0);
     task.add(std::move(open_gripper));
@@ -598,7 +896,6 @@ int main(int argc, char *argv[])
     allow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_allow_list, true);
     task.add(std::move(allow_octomap_coll));
 
-
     // Stage 5: Descend to Cube (Joint Space)
     auto descend = std::make_unique<mtc::stages::MoveTo>("descend to cube", pipeline);
     descend->setGroup("arm");
@@ -609,7 +906,7 @@ int main(int argc, char *argv[])
             grasp_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    descend->setGoal(grasp_targets); 
+    descend->setGoal(grasp_targets);
     descend->setProperty("timeout", 10.0);
     task.add(std::move(descend));
 
@@ -617,14 +914,14 @@ int main(int argc, char *argv[])
     auto close_gripper = std::make_unique<mtc::stages::MoveTo>("close gripper", gripper_pipeline);
     close_gripper->setGroup("gripper");
     std::map<std::string, double> gripper_close;
-    gripper_close["wrist_2_gripper_joint"] = 0.475; 
+    gripper_close["wrist_2_gripper_joint"] = 0.475;
     close_gripper->setGoal(gripper_close);
     close_gripper->setProperty("timeout", 5.0);
     task.add(std::move(close_gripper));
 
     // Stage 7: Attach Cube to Gripper
     auto attach_cube = std::make_unique<mtc::stages::ModifyPlanningScene>("attach cube");
-    attach_cube->attachObject("red_cube", "gripper"); 
+    attach_cube->attachObject("red_cube", "gripper");
     task.add(std::move(attach_cube));
 
     // Stage 8: Lift Up (Joint Space)
@@ -637,7 +934,7 @@ int main(int argc, char *argv[])
             lift_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    lift->setGoal(lift_targets); 
+    lift->setGoal(lift_targets);
     lift->setProperty("timeout", 10.0);
     task.add(std::move(lift));
 
@@ -660,9 +957,26 @@ int main(int argc, char *argv[])
             place_approach_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    move_to_place->setGoal(place_approach_targets); 
+    move_to_place->setGoal(place_approach_targets);
     move_to_place->setProperty("timeout", 10.0);
     task.add(std::move(move_to_place));
+
+    // ==========================================
+    // Stage 9.4: Fix Orientation — snap the wrist back to the canonical place-facing
+    // orientation now that we're at the place-approach position.
+    // ==========================================
+    auto fix_orientation_place = std::make_unique<mtc::stages::MoveTo>("fix orientation (place)", pipeline);
+    fix_orientation_place->setGroup("arm");
+    std::map<std::string, double> fix_orientation_place_targets;
+    for (size_t i = 0; i < joint_names.size(); ++i) {
+        fix_orientation_place_targets[joint_names[i]] = fix_orientation_place_joint_values[i];
+        if (joint_names[i] == "wrist_1_wrist_2_joint") {
+            fix_orientation_place_targets[joint_names[i]] += M_PI / 2.0;
+        }
+    }
+    fix_orientation_place->setGoal(fix_orientation_place_targets);
+    fix_orientation_place->setProperty("timeout", 10.0);
+    task.add(std::move(fix_orientation_place));
 
     // ==========================================
     // Stage 9.5: Descend to Place Surface (now clear of the wall)
@@ -676,7 +990,7 @@ int main(int argc, char *argv[])
             place_targets[joint_names[i]] += M_PI / 2.0;
         }
     }
-    descend_to_place->setGoal(place_targets); 
+    descend_to_place->setGoal(place_targets);
     descend_to_place->setProperty("timeout", 10.0);
     task.add(std::move(descend_to_place));
 
@@ -686,7 +1000,7 @@ int main(int argc, char *argv[])
     auto open_gripper_place = std::make_unique<mtc::stages::MoveTo>("open gripper place", gripper_pipeline);
     open_gripper_place->setGroup("gripper");
     std::map<std::string, double> gripper_open_place;
-    gripper_open_place["wrist_2_gripper_joint"] = 1.0; 
+    gripper_open_place["wrist_2_gripper_joint"] = 1.0;
     open_gripper_place->setGoal(gripper_open_place);
     open_gripper_place->setProperty("timeout", 5.0);
     task.add(std::move(open_gripper_place));
@@ -704,12 +1018,12 @@ int main(int argc, char *argv[])
     // Move back to the exact joint positions the robot was in when the node started.
     auto return_to_start = std::make_unique<mtc::stages::MoveTo>("return to start", pipeline);
     return_to_start->setGroup("arm");
-    
+
     std::map<std::string, double> start_targets;
     for (size_t i = 0; i < joint_names.size(); ++i) {
         start_targets[joint_names[i]] = initial_joint_values[i];
     }
-    return_to_start->setGoal(start_targets); 
+    return_to_start->setGoal(start_targets);
     return_to_start->setProperty("timeout", 10.0);
     task.add(std::move(return_to_start));
 
@@ -742,38 +1056,39 @@ int main(int argc, char *argv[])
 
         auto sol = task.solutions().front();
         auto compound = dynamic_cast<const mtc::SolutionSequence*>(sol.get());
-        
+
         if (compound) {
             for (const auto& sub : compound->solutions()) {
                 auto traj = dynamic_cast<const mtc::SubTrajectory*>(sub);
                 if (traj && traj->trajectory()) {
-                    
+
                     auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
                     std::string group_name = rt->getGroupName();
                     std::string stage_name = traj->creator()->name();
 
                     MoveGroupInterface::Plan plan;
                     RCLCPP_INFO(logger, "Executing '%s' trajectory...", stage_name.c_str());
-                    
+
                     trajectory_processing::TimeOptimalTrajectoryGeneration totg;
                     totg.computeTimeStamps(*rt, 0.1, 0.1);
 
                     rt->getRobotTrajectoryMsg(plan.trajectory);
-                    
+
                     if (plan.trajectory.joint_trajectory.points.empty()) {
                         continue;
                     }
 
+                    moveit::core::MoveItErrorCode exec_result;
                     if (group_name == "gripper") {
                         if (stage_name == "open gripper place") {
                             RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
                             arm_group.detachObject("red_cube");
-                            
+
                             // DETACH IN GAZEBO
                             RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
                             auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
                             auto detach_future = detach_client->async_send_request(detach_req);
-                            
+
                             auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
                             if (detach_status == std::future_status::ready) {
                                 auto detach_res = detach_future.get();
@@ -787,7 +1102,7 @@ int main(int argc, char *argv[])
                             }
                             rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
-                        gripper_group.execute(plan);
+                        exec_result = gripper_group.execute(plan);
                     } else {
                         if (stage_name == "lift up") {
                             RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
@@ -797,12 +1112,12 @@ int main(int argc, char *argv[])
                             } else {
                                 RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
                             }
-                            
+
                             // ATTACH IN GAZEBO
                             RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
                             auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
                             auto attach_future = attach_client->async_send_request(attach_req);
-                            
+
                             auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
                             if (attach_status == std::future_status::ready) {
                                 auto attach_res = attach_future.get();
@@ -816,7 +1131,19 @@ int main(int argc, char *argv[])
                             }
                             rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
-                        arm_group.execute(plan);
+                        exec_result = arm_group.execute(plan);
+                    }
+
+                    // CRITICAL: stop immediately if a stage didn't actually execute. Without
+                    // this check, a single aborted stage (e.g. "start point deviates from
+                    // current robot state" after a slow gripper close) was silently ignored,
+                    // and every subsequent stage's trajectory — planned assuming the previous
+                    // stage HAD moved the robot — kept getting sent anyway, cascading into a
+                    // string of aborts and an arm that ends up somewhere nobody planned for.
+                    if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                        RCLCPP_ERROR(logger, "Execution of '%s' FAILED (error code %d) — stopping here instead of executing further stages.",
+                                     stage_name.c_str(), exec_result.val);
+                        break;
                     }
                 }
             }
@@ -826,25 +1153,26 @@ int main(int argc, char *argv[])
                 auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
                 std::string group_name = rt->getGroupName();
                 std::string stage_name = traj->creator()->name();
-                
+
                 MoveGroupInterface::Plan plan;
                 RCLCPP_INFO(logger, "Executing '%s' trajectory...", stage_name.c_str());
-                
+
                 trajectory_processing::TimeOptimalTrajectoryGeneration totg;
                 totg.computeTimeStamps(*rt, 0.1, 0.1);
-                
+
                 rt->getRobotTrajectoryMsg(plan.trajectory);
                 if (!plan.trajectory.joint_trajectory.points.empty()) {
+                    moveit::core::MoveItErrorCode exec_result;
                     if (group_name == "gripper") {
                         if (stage_name == "open gripper place") {
                             RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
                             arm_group.detachObject("red_cube");
-                            
+
                             // DETACH IN GAZEBO
                             RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
                             auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
                             auto detach_future = detach_client->async_send_request(detach_req);
-                            
+
                             auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
                             if (detach_status == std::future_status::ready) {
                                 auto detach_res = detach_future.get();
@@ -858,7 +1186,7 @@ int main(int argc, char *argv[])
                             }
                             rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
-                        gripper_group.execute(plan);
+                        exec_result = gripper_group.execute(plan);
                     } else {
                         if (stage_name == "lift up") {
                             RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
@@ -868,12 +1196,12 @@ int main(int argc, char *argv[])
                             } else {
                                 RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
                             }
-                            
+
                             // ATTACH IN GAZEBO
                             RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
                             auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
                             auto attach_future = attach_client->async_send_request(attach_req);
-                            
+
                             auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
                             if (attach_status == std::future_status::ready) {
                                 auto attach_res = attach_future.get();
@@ -887,7 +1215,12 @@ int main(int argc, char *argv[])
                             }
                             rclcpp::sleep_for(std::chrono::milliseconds(100));
                         }
-                        arm_group.execute(plan);
+                        exec_result = arm_group.execute(plan);
+                    }
+
+                    if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                        RCLCPP_ERROR(logger, "Execution of '%s' FAILED (error code %d).",
+                                     stage_name.c_str(), exec_result.val);
                     }
                 }
             }
@@ -905,9 +1238,9 @@ int main(int argc, char *argv[])
     if (final_state) {
         Eigen::Isometry3d final_w2 = final_state->getGlobalLinkTransform("wrist_2");
         Eigen::Isometry3d final_grip = final_state->getGlobalLinkTransform("gripper");
-        RCLCPP_INFO(logger, "Final Wrist 2 Pose -> x: %f, y: %f, z: %f", 
+        RCLCPP_INFO(logger, "Final Wrist 2 Pose -> x: %f, y: %f, z: %f",
             final_w2.translation().x(), final_w2.translation().y(), final_w2.translation().z());
-        RCLCPP_INFO(logger, "Final Gripper Pose -> x: %f, y: %f, z: %f", 
+        RCLCPP_INFO(logger, "Final Gripper Pose -> x: %f, y: %f, z: %f",
             final_grip.translation().x(), final_grip.translation().y(), final_grip.translation().z());
     }
 
