@@ -126,7 +126,7 @@ src/
 The `red_cube_detector` node subscribes to the RGB and depth streams from both cameras and locates the target object using classical computer vision. The RGB image is converted from BGR to HSV, since HSV makes color isolation far more robust to lighting than raw RGB thresholds. Two HSV ranges are applied to detect red, producing a binary mask, which is then cleaned up with morphological erosion and dilation to remove noise. Contours are extracted from the mask, the largest contour above a minimum area is assumed to be the cube, and its centroid is computed via image moments. That pixel location is then looked up in the synchronized depth image and projected into a 3D world-frame coordinate, which is published as the cube's pose for the planner to consume.
 
 <!-- TODO: screenshot of the HSV mask / detected contour overlay next to the RGB feed -->
-![Cube detection](docs/media/cube_detection.png)
+![Cube detection](docs/media/overhead_camera_screenshot.png)
 
 ### Custom 5-DOF Inverse Kinematics
 
@@ -144,7 +144,7 @@ Point clouds from both the overhead and front cameras are fused into a live Octo
 The world includes a physical obstacle placed between the pick and place locations, so the arm is forced to plan around it rather than through it — a direct demonstration of the collision-aware planning working end-to-end, rather than only being collision-aware for the object being grasped.
 
 <!-- TODO: RViz screenshot of the octomap voxel grid with the arm routing around the obstacle -->
-![Octomap obstacle avoidance](docs/media/octomap_avoidance.png)
+![Octomap obstacle avoidance](docs/media/octomap_voxel.png)
 
 ### MoveIt Task Constructor Pipeline
 
@@ -169,7 +169,7 @@ MoveIt's planning-scene "attach object" call is purely conceptual — it updates
 
 ## Notable Engineering Challenges
 
-A few problems that took real debugging to get right — full detail in [CHANGELOG.md](CHANGELOG.md):
+A few problems that took real debugging to get right — full detail in [CHANGELOG.md](docs/ChangeLog.md):
 
 - **Getting MTC to actually see the octomap.** The obvious approach — constructing a fresh planning scene for MTC's first stage — silently produced an *empty* world with no octomap in it at all, since it never inherited anything from the live, sensor-fed scene `move_group` was maintaining. The fix was sourcing that first stage's scene from the same live `PlanningSceneMonitor`, not building one from scratch.
 - **Telling real obstacles apart from the robot's own body.** With too tight a self-filter margin, the cameras would occasionally perceive part of the arm's own base as an obstacle at certain joint angles, producing phantom "invalid goal state" failures. Fixing it meant tuning the self-filter padding across the arm's full range of motion, not just at rest.
