@@ -26,7 +26,7 @@
       <uri>model://sun</uri>
     </include>
     <model name="red_cube">
-      <pose>0.1 0.4 0.015 0 0 0</pose>
+      <pose>0.1 0.4 1.03 0 0 0</pose>
       <link name="link">
         <visual name="visual">
           <geometry>
@@ -60,7 +60,7 @@
     <model name="collection_box">
       <static>true</static>
 
-      <pose>-0.15 0.3 0 0 0 0</pose>
+      <pose>-0.15 0.3 1.015 0 0 0</pose>
 
       <link name="box">
 
@@ -164,7 +164,7 @@
 
     <model name="static_obstacle_1">
       <static>true</static>
-      <pose>-0.05 0.375 0.055 0 0 0.0</pose>
+      <pose>-0.05 0.375 1.07 0 0 0.0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
@@ -182,6 +182,12 @@
         </visual>
       </link>
     </model>
+
+    <include>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Table</uri>
+      <name>table</name>
+      <pose>0 0.35 0 0 0 0</pose>
+    </include>
 
   </world>
 </sdf>

@@ -87,6 +87,7 @@ def generate_launch_description():
         output='screen',
         arguments=['-string', doc.toxml(),
                    '-name', 'giraffe',
+                   '-z', '1.015',
                    '-allow_renaming', 'true'],
     )
 
