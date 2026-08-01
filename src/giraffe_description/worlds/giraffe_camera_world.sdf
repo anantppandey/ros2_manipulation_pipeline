@@ -57,6 +57,74 @@
       </link>
     </model>
 
+    <model name="blue_cube">
+      <pose>0.18 0.32 1.03 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.1 0.25 0.8 1</ambient>
+            <diffuse>0.1 0.25 0.8 1</diffuse>
+          </material>
+        </visual>
+
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <inertial>
+          <mass>1.0</mass>
+          <inertia>
+            <ixx>0.001</ixx>
+            <iyy>0.001</iyy>
+            <izz>0.001</izz>
+          </inertia>
+        </inertial>
+      </link>
+    </model>
+
+    <model name="yellow_cube">
+      <pose>-0.125 0.41 1.03 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.85 0.72 0.18 1</ambient>
+            <diffuse>0.85 0.72 0.18 1</diffuse>
+          </material>
+        </visual>
+
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.03 0.03 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <inertial>
+          <mass>1.0</mass>
+          <inertia>
+            <ixx>0.001</ixx>
+            <iyy>0.001</iyy>
+            <izz>0.001</izz>
+          </inertia>
+        </inertial>
+      </link>
+    </model>
+
     <model name="collection_box">
       <static>true</static>
 
@@ -81,6 +149,33 @@
               <size>0.09 0.09 0.01</size>
             </box>
           </geometry>
+        </visual>
+
+        <!-- X marker -->
+        <visual name="x_mark_1">
+          <pose>0 0 0.0105 0 0 0.785398</pose>
+          <geometry>
+            <box>
+              <size>0.06 0.004 0.001</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+          </material>
+        </visual>
+
+        <visual name="x_mark_2">
+          <pose>0 0 0.0105 0 0 -0.785398</pose>
+          <geometry>
+            <box>
+              <size>0.06 0.004 0.001</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+          </material>
         </visual>
 
         <!-- Left wall -->

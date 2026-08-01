@@ -89,48 +89,58 @@ private:
         y_cam = Y_MIN + ((ny + 1.0) / 2.0) * (Y_MAX - Y_MIN);
     }
     
-    void drawMappingBounds(cv::Mat& frame)
+    // ------------------------------------------------------------------
+    // NEW: shared helper for the blue/yellow/box detections below.
+    // Takes a detected pixel, applies the SAME pixelToCamera() + world
+    // transform logic already used for the red cube, and just prints
+    // the resulting values (no publishing yet, per your request).
+    // The red cube block further down is untouched and still publishes
+    // to /cube_pose on its own.
+    // ------------------------------------------------------------------
+    void reportDetection(const std::string& label,
+                          const cv::Point2f& pixel,
+                          const cv::Mat& depth,
+                          cv::Mat& frame,
+                          const cv::Scalar& draw_color,
+                          const std::string& emoji_tag)
     {
-        // Draw the 4 corners of our mapping space for visualization
-        const float IMG_HEIGHT = 240.0;
-        const float NORM_FACTOR = IMG_HEIGHT / 2.0;
-        const float IMG_CENTER_X = 160.0;
-        const float IMG_CENTER_Y = 120.0;
-        
-        // Recalibrated corners in normalized space
-        // These are the corners of our mapping space
-        std::vector<std::pair<float, float>> corners_norm = {
-            {-1.0, 1.0},   // Top-left
-            {1.0, 1.0},    // Top-right
-            {1.0, -1.0},   // Bottom-right
-            {-1.0, -1.0}   // Bottom-left
-        };
-        
-        std::vector<cv::Point> corners_pixel;
-        for (auto& [nx, ny] : corners_norm) {
-            float u = nx * NORM_FACTOR + IMG_CENTER_X;
-            float v = -ny * NORM_FACTOR + IMG_CENTER_Y;
-            corners_pixel.push_back(cv::Point((int)u, (int)v));
+        if (pixel.x <= 0 || pixel.y <= 0) {
+            return;
         }
-        
-        // Draw the polygon
-        cv::polylines(frame, corners_pixel, true, cv::Scalar(255, 0, 0), 2);
-        
-        // Draw center
-        cv::circle(frame, cv::Point(160, 120), 5, cv::Scalar(255, 0, 0), -1);
-        cv::putText(frame, "CENTER", cv::Point(145, 115), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 0), 1);
-        
-        // Draw the calibrated points
-        // Point 1: (197, 63)
-        cv::circle(frame, cv::Point(197, 63), 5, cv::Scalar(0, 255, 255), -1);
-        cv::putText(frame, "P1", cv::Point(197-15, 63-10), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(0, 255, 255), 1);
-        
-        // Point 2: (235, 100)
-        cv::circle(frame, cv::Point(235, 100), 5, cv::Scalar(0, 255, 255), -1);
-        cv::putText(frame, "P2", cv::Point(235-15, 100-10), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(0, 255, 255), 1);
+
+        int u = (int)pixel.x;
+        int v = (int)pixel.y;
+
+        if (u < 0 || u >= depth.cols || v < 0 || v >= depth.rows) {
+            return;
+        }
+
+        float depth_value = depth.at<float>(v, u);
+        if (depth_value <= 0.05 || depth_value >= 5.0) {
+            return;
+        }
+
+        // Same pixel -> camera -> world mapping as the red cube
+        float x_cam, y_cam;
+        pixelToCamera(u, v, x_cam, y_cam);
+        float z_cam = depth_value;
+
+        float world_x = 0.25 - x_cam;
+        float world_y = y_cam;
+        float world_z = 0.75 - z_cam + 0.04;
+
+        RCLCPP_INFO(this->get_logger(), "Pixel: (%d, %d), Depth: %.3fm", u, v, depth_value);
+        RCLCPP_INFO(this->get_logger(), "%s in CAMERA frame: (%.3f, %.3f, %.3f) meters",
+                   label.c_str(), x_cam, y_cam, z_cam);
+        RCLCPP_INFO(this->get_logger(), "%s %s in WORLD frame: (%.3f, %.3f, %.3f) meters",
+                   emoji_tag.c_str(), label.c_str(), world_x, world_y, world_z);
+
+        // Crosshair at the exact detected pixel so you can see where the
+        // code thinks the cube/marker is, not just the printed values
+        cv::drawMarker(frame, pixel, draw_color, cv::MARKER_CROSS, 16, 2);
+        cv::putText(frame, label,
+                   cv::Point(pixel.x - 40, pixel.y - 15),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2);
     }
     
     void rgbdCallback(const sensor_msgs::msg::Image::ConstSharedPtr& rgb_msg,
@@ -213,23 +223,30 @@ private:
                         RCLCPP_INFO(this->get_logger(), "    w: 1.000");
                         RCLCPP_INFO(this->get_logger(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         
-                        // Draw detection on frame
-                        cv::circle(frame, cube_pixel, 10, cv::Scalar(0, 255, 0), -1);
+                        // Draw detection on frame - crosshair + name
+                        cv::drawMarker(frame, cube_pixel, cv::Scalar(0, 255, 0), cv::MARKER_CROSS, 16, 2);
                         cv::putText(frame, "RED CUBE", 
                                    cv::Point(cube_pixel.x - 40, cube_pixel.y - 15),
                                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-                        
-                        char depth_text[50];
-                        sprintf(depth_text, "Depth: %.2fm", depth_value);
-                        cv::putText(frame, depth_text, 
-                                   cv::Point(cube_pixel.x - 40, cube_pixel.y + 25),
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 0), 1);
-                        
-                        // Draw mapping bounds for visualization
-                        drawMappingBounds(frame);
                     }
                 }
             }
+
+            // ================================================================
+            // Blue / yellow cube + collection box detection - same
+            // pixel -> depth -> pixelToCamera -> world logic as the red
+            // cube above, routed through reportDetection() so each one
+            // prints its values and draws a crosshair + name.
+            // ================================================================
+
+            cv::Point2f blue_pixel = detectBlueCube(frame);
+            reportDetection("BLUE CUBE", blue_pixel, depth, frame, cv::Scalar(255, 0, 0), "🔵");
+
+            cv::Point2f yellow_pixel = detectYellowCube(frame);
+            reportDetection("YELLOW CUBE", yellow_pixel, depth, frame, cv::Scalar(0, 255, 255), "🟡");
+
+            cv::Point2f box_pixel = detectCollectionBox(frame);
+            reportDetection("COLLECTION BOX", box_pixel, depth, frame, cv::Scalar(255, 0, 255), "❌");
             
             cv::imshow("Overhead Camera", frame);
             cv::waitKey(1);
@@ -284,6 +301,187 @@ private:
         }
         
         return cv::Point2f(-1, -1);
+    }
+
+    // ------------------------------------------------------------------
+    // NEW: blue cube.
+    // Gazebo material ambient/diffuse (0.1, 0.25, 0.8) -> ~RGB(26,64,204)
+    // -> ~HSV(114, 223, 204) in OpenCV's 0-179/0-255/0-255 scale.
+    // Range below is padded around that estimate; tune if the overhead
+    // camera's lighting shifts the actual rendered color.
+    // ------------------------------------------------------------------
+    cv::Point2f detectBlueCube(cv::Mat& frame)
+    {
+        cv::Mat hsv;
+        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+        cv::Scalar lower_blue(100, 100, 60);
+        cv::Scalar upper_blue(130, 255, 255);
+
+        cv::Mat blue_mask;
+        cv::inRange(hsv, lower_blue, upper_blue, blue_mask);
+
+        cv::erode(blue_mask, blue_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+        cv::dilate(blue_mask, blue_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(blue_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if (!contours.empty()) {
+            int largest_idx = 0;
+            double largest_area = cv::contourArea(contours[0]);
+
+            for (size_t i = 1; i < contours.size(); i++) {
+                double area = cv::contourArea(contours[i]);
+                if (area > largest_area) {
+                    largest_area = area;
+                    largest_idx = i;
+                }
+            }
+
+            if (largest_area > 100) {
+                cv::Moments m = cv::moments(contours[largest_idx]);
+                if (m.m00 != 0) {
+                    return cv::Point2f(m.m10 / m.m00, m.m01 / m.m00);
+                }
+            }
+        }
+
+        return cv::Point2f(-1, -1);
+    }
+
+    // ------------------------------------------------------------------
+    // NEW: yellow cube.
+    // Gazebo material ambient/diffuse (0.85, 0.72, 0.18) -> ~RGB(217,184,46)
+    // -> ~HSV(24, 201, 217). Range below is padded around that estimate.
+    // ------------------------------------------------------------------
+    cv::Point2f detectYellowCube(cv::Mat& frame)
+    {
+        cv::Mat hsv;
+        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+        cv::Scalar lower_yellow(15, 100, 100);
+        cv::Scalar upper_yellow(35, 255, 255);
+
+        cv::Mat yellow_mask;
+        cv::inRange(hsv, lower_yellow, upper_yellow, yellow_mask);
+
+        cv::erode(yellow_mask, yellow_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+        cv::dilate(yellow_mask, yellow_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(yellow_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if (!contours.empty()) {
+            int largest_idx = 0;
+            double largest_area = cv::contourArea(contours[0]);
+
+            for (size_t i = 1; i < contours.size(); i++) {
+                double area = cv::contourArea(contours[i]);
+                if (area > largest_area) {
+                    largest_area = area;
+                    largest_idx = i;
+                }
+            }
+
+            if (largest_area > 100) {
+                cv::Moments m = cv::moments(contours[largest_idx]);
+                if (m.m00 != 0) {
+                    return cv::Point2f(m.m10 / m.m00, m.m01 / m.m00);
+                }
+            }
+        }
+
+        return cv::Point2f(-1, -1);
+    }
+
+    // ------------------------------------------------------------------
+    // Collection box - two-stage approach.
+    // Stage 1: threshold black to find roughly where the box is. The
+    // box's bottom plate and its walls can show up as separate contours
+    // (and a wall's visible face can out-area the flat top plate), so
+    // taking "the largest black contour" was landing on a wall instead
+    // of the box center. Fixed by taking the UNION of every sizeable
+    // dark contour's bounding box instead of just the single largest one
+    // - that reliably covers the whole box regardless of which part
+    // happens to be biggest.
+    // Stage 2: within that region only, look for the white X marker and
+    // use its centroid as the final point - this also keeps the white
+    // arm (which sits elsewhere in the frame) from being mistaken for
+    // the marker, since we only search inside the box's black region.
+    // Falls back to the black region's center if no white X is visible
+    // in it (e.g. arm briefly occluding the marker).
+    // ------------------------------------------------------------------
+    cv::Point2f detectCollectionBox(cv::Mat& frame)
+    {
+        cv::Mat hsv;
+        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+        // --- Stage 1: locate the box region via black ---
+        cv::Scalar lower_black(0, 0, 0);
+        cv::Scalar upper_black(179, 255, 50);
+
+        cv::Mat black_mask;
+        cv::inRange(hsv, lower_black, upper_black, black_mask);
+
+        cv::erode(black_mask, black_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+        cv::dilate(black_mask, black_mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+
+        std::vector<std::vector<cv::Point>> black_contours;
+        cv::findContours(black_mask, black_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        bool found_black = false;
+        cv::Rect box_roi;
+
+        for (const auto& c : black_contours) {
+            if (cv::contourArea(c) > 100) {
+                cv::Rect r = cv::boundingRect(c);
+                box_roi = found_black ? (box_roi | r) : r;
+                found_black = true;
+            }
+        }
+
+        if (!found_black) {
+            return cv::Point2f(-1, -1);
+        }
+
+        // --- Stage 2: find the white X marker, but only inside box_roi ---
+        cv::Scalar lower_white(0, 0, 200);
+        cv::Scalar upper_white(179, 40, 255);
+
+        cv::Mat white_mask;
+        cv::inRange(hsv, lower_white, upper_white, white_mask);
+
+        cv::Mat roi_mask = cv::Mat::zeros(white_mask.size(), CV_8UC1);
+        white_mask(box_roi).copyTo(roi_mask(box_roi));
+
+        std::vector<std::vector<cv::Point>> white_contours;
+        cv::findContours(roi_mask, white_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if (!white_contours.empty()) {
+            int largest_idx = 0;
+            double largest_area = cv::contourArea(white_contours[0]);
+
+            for (size_t i = 1; i < white_contours.size(); i++) {
+                double area = cv::contourArea(white_contours[i]);
+                if (area > largest_area) {
+                    largest_area = area;
+                    largest_idx = i;
+                }
+            }
+
+            if (largest_area > 20) {
+                cv::Moments m = cv::moments(white_contours[largest_idx]);
+                if (m.m00 != 0) {
+                    return cv::Point2f(m.m10 / m.m00, m.m01 / m.m00);
+                }
+            }
+        }
+
+        // Fallback: no white X visible inside the box region right now -
+        // use the black region's center instead of failing outright.
+        return cv::Point2f(box_roi.x + box_roi.width / 2.0f,
+                            box_roi.y + box_roi.height / 2.0f);
     }
     
     // Subscribers
