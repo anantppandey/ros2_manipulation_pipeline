@@ -4,8 +4,11 @@
 #include <vector>
 #include <map>
 #include <string>
+#include <mutex>
+#include <atomic>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <moveit/move_group_interface/move_group_interface.hpp>
 #include <moveit/planning_scene_interface/planning_scene_interface.hpp>
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
@@ -14,7 +17,6 @@
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <mutex>
 #include <Eigen/Geometry>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -40,21 +42,15 @@
 #include <moveit/robot_state/robot_state.h>
 #include <random>
 
+#include "giraffe_mtc/action/pick_place.hpp"
+
 namespace mtc = moveit::task_constructor;
-
-geometry_msgs::msg::Pose latest_pose;
-bool pose_received = false;
-std::mutex pose_mutex;
-
-void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-{
-    std::lock_guard<std::mutex> lock(pose_mutex);
-    latest_pose = msg->pose;
-    pose_received = true;
-}
 
 // ==========================================
 // SHARED ORIENTATION HELPERS
+// (unchanged from the original file - these don't touch node/goal state at
+// all, they just take a seed state + scene + target and return joint values,
+// so nothing about the action-server conversion affects them)
 // ==========================================
 double computeTargetWorldYaw(const Eigen::Vector3d& sp_translation, double x, double y)
 {
@@ -435,818 +431,889 @@ bool computeFixedOrientationIK(moveit::core::RobotState* seed_state,
     return false;
 }
 
-int main(int argc, char *argv[])
+// ==========================================
+// PICK-PLACE ACTION SERVER
+//
+// Everything above this point is untouched. Everything below replaces the
+// old one-shot main(): instead of waiting on a /cube_pose topic, building
+// one MTC task, executing it, and exiting, this node stays alive and runs
+// the exact same setup + IK + MTC pipeline once per accepted goal.
+//
+// Behavior changes worth knowing about vs. the original script:
+//   - On failure, the old code called rclcpp::shutdown() and exited the
+//     process. Here, a failure aborts the CURRENT GOAL (goal_handle->abort)
+//     and the node stays alive, ready for the next goal. That's the whole
+//     point of making it an action server, but it's a real change from
+//     "crash and relaunch" to "report failure and wait" — worth watching
+//     for the first few runs.
+//   - place_pose.position.z from the goal is intentionally NOT used yet.
+//     The original code derived place_approach_z from lift_z (where the
+//     arm ends up after lifting the cube) plus a hand-tuned clearance,
+//     not from any real target height - so place_z ends up constant
+//     regardless of what "place height" you'd ask for. I kept that exact
+//     derivation rather than guess at swapping in goal z, since it's the
+//     tuned behavior that's known to work. Revisit this once real box-
+//     height detection feeds into place_pose.
+//   - The collision object id is still the literal "red_cube" (via a
+//     single OBJECT_ID constant now, instead of ~8 repeated string
+//     literals) - not yet tied to which object was actually picked. That's
+//     the next step, once the detector publishes labeled detections.
+//   - The original file had two nearly-identical execution loops (one for
+//     a multi-stage "compound" solution, one for a lone SubTrajectory).
+//     They're unified into one runSubTrajectory lambda used by both paths
+//     below - same logic, no duplication. In practice this task always
+//     produces a compound solution (14 stages), so the "lone trajectory"
+//     path is a fallback that's unlikely to run.
+// ==========================================
+class PickPlaceActionServer : public rclcpp::Node
 {
-    rclcpp::init(argc, argv);
+public:
+    using PickPlace = giraffe_mtc::action::PickPlace;
+    using GoalHandlePickPlace = rclcpp_action::ServerGoalHandle<PickPlace>;
 
-    auto node = std::make_shared<rclcpp::Node>(
-        "mtc_move_to_cube",
-        rclcpp::NodeOptions()
-            .automatically_declare_parameters_from_overrides(true)
-            .parameter_overrides({
-                rclcpp::Parameter("use_sim_time", true)
-            }));
+    PickPlaceActionServer()
+    : Node("mtc_move_to_cube",
+           rclcpp::NodeOptions()
+               .automatically_declare_parameters_from_overrides(true)
+               .parameter_overrides({rclcpp::Parameter("use_sim_time", true)}))
+    {
+        action_server_ = rclcpp_action::create_server<PickPlace>(
+            this,
+            "pick_place",
+            std::bind(&PickPlaceActionServer::handleGoal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&PickPlaceActionServer::handleCancel, this, std::placeholders::_1),
+            std::bind(&PickPlaceActionServer::handleAccepted, this, std::placeholders::_1));
 
-    auto logger = rclcpp::get_logger("mtc_move_to_cube");
+        attach_client_ = this->create_client<std_srvs::srv::Trigger>("/gripper/attach");
+        detach_client_ = this->create_client<std_srvs::srv::Trigger>("/gripper/detach");
 
-    auto pose_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/cube_pose", 10, poseCallback);
-
-    rclcpp::executors::SingleThreadedExecutor executor;
-    executor.add_node(node);
-
-    // Create service clients for Gazebo attach/detach
-    auto attach_client = node->create_client<std_srvs::srv::Trigger>("/gripper/attach");
-    auto detach_client = node->create_client<std_srvs::srv::Trigger>("/gripper/detach");
-
-    // Wait for services
-    RCLCPP_INFO(logger, "Waiting for Gazebo attach/detach services...");
-    while (!attach_client->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
-        RCLCPP_INFO(logger, "Gazebo attach service not available, waiting...");
-    }
-    while (!detach_client->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
-        RCLCPP_INFO(logger, "Gazebo detach service not available, waiting...");
-    }
-    RCLCPP_INFO(logger, "Gazebo services ready!");
-
-    std::thread spinner([&executor]() {
-        executor.spin();
-    });
-
-    // ==========================================
-    // TWEAK THESE VALUES FOR TRIAL AND ERROR
-    // ==========================================
-    double CUBE_X_OFFSET = -0.005;
-    double CUBE_Y_OFFSET = 0.0;
-    double CUBE_Z_OFFSET = -0.055;
-
-    double GRIPPER_X_OFFSET = -0.0;
-    double GRIPPER_Y_OFFSET = -0.0275;
-    double GRIPPER_Z_OFFSET = 0.0275;
-
-    double DESCEND_DISTANCE = 0.05;
-    double LIFT_DISTANCE = 0.10;
-
-    double PLACE_APPROACH_CLEARANCE = 0.08;  // TUNE: height above lift_z needed to clear the wall at the place x/y — verify in RViz first
-    double PLACE_DESCEND_DISTANCE = 0.08;     // TUNE: how far to lower onto the place surface once clear of the wall
-
-    // ==========================================
-    // 1. INITIALIZE TASK AND ROBOT MODEL
-    // ==========================================
-    mtc::Task task("move_to_cube");
-    task.loadRobotModel(node);
-    auto robot_model = task.getRobotModel();
-
-    if (!robot_model) {
-        RCLCPP_ERROR(logger, "Failed to load robot model");
-        rclcpp::shutdown();
-        return 1;
+        auto logger = this->get_logger();
+        RCLCPP_INFO(logger, "Waiting for Gazebo attach/detach services...");
+        while (!attach_client_->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
+            RCLCPP_INFO(logger, "Gazebo attach service not available, waiting...");
+        }
+        while (!detach_client_->wait_for_service(std::chrono::seconds(1)) && rclcpp::ok()) {
+            RCLCPP_INFO(logger, "Gazebo detach service not available, waiting...");
+        }
+        RCLCPP_INFO(logger, "Gazebo services ready! pick_place action server started.");
     }
 
-    // ==========================================
-    // 2. GET CURRENT STATE DIRECTLY FROM TF/JOINT_STATES
-    // ==========================================
-    auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
-    auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
-    auto monitor = std::make_shared<planning_scene_monitor::CurrentStateMonitor>(
-        node, robot_model, tf_buffer, true);
-
-    rclcpp::sleep_for(std::chrono::seconds(3));
-
-    RCLCPP_INFO(logger, "Waiting for robot state...");
-    monitor->waitForCompleteState("arm", 5.0);
-    monitor->waitForCompleteState("gripper", 5.0);
-    moveit::core::RobotStatePtr current_state = monitor->getCurrentState();
-
-    if (!current_state) {
-        RCLCPP_ERROR(logger, "Failed to get current robot state");
-        rclcpp::shutdown();
-        return 1;
+private:
+    rclcpp_action::GoalResponse handleGoal(const rclcpp_action::GoalUUID&,
+                                            std::shared_ptr<const PickPlace::Goal> goal)
+    {
+        if (goal_active_.load()) {
+            RCLCPP_WARN(this->get_logger(), "Rejecting goal - a pick-place is already in progress");
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+        const auto& p = goal->pick_pose.position;
+        if (p.x == 0.0 && p.y == 0.0 && p.z == 0.0) {
+            RCLCPP_WARN(this->get_logger(), "Rejecting goal - pick_pose looks uninitialized (0,0,0)");
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
-    // Captured ONCE, before any motion — every desired (fixed) orientation is anchored
-    // to this, never to a later/mutated state.
-    Eigen::Isometry3d initial_sp_pose     = current_state->getGlobalLinkTransform("shoulder_pan");
-    Eigen::Isometry3d initial_wrist2_pose = current_state->getGlobalLinkTransform("wrist_2");
+    rclcpp_action::CancelResponse handleCancel(const std::shared_ptr<GoalHandlePickPlace>)
+    {
+        // Accepted, but not wired into the middle of an in-flight plan/execute
+        // call below - a goal already planning or moving will still run to
+        // completion. Real mid-task cancellation would need cooperative check
+        // points inside the execution loop; flagging that honestly rather than
+        // pretending it's there.
+        RCLCPP_WARN(this->get_logger(), "Cancel requested - will not interrupt a motion already in progress");
+        return rclcpp_action::CancelResponse::ACCEPT;
+    }
 
-    // NEW: this monitor is what actually syncs world geometry (incl. octomap) from move_group
-    auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node, "robot_description");
-    psm->startSceneMonitor();
-    psm->startWorldGeometryMonitor();   // <-- this is the one that carries octomap updates
-    psm->startStateMonitor();
+    void handleAccepted(const std::shared_ptr<GoalHandlePickPlace> goal_handle)
+    {
+        goal_active_.store(true);
+        // MTC planning + execution blocks for a while, so it runs on its own
+        // thread - the node's own executor thread stays free to keep servicing
+        // tf, the planning scene monitor, MoveGroupInterface, and action
+        // negotiation for the (currently rejected) next goal.
+        std::thread{std::bind(&PickPlaceActionServer::execute, this, goal_handle)}.detach();
+    }
 
-    // Force-clear any stale occupied voxels left from earlier testing (e.g. before the
-    // padding was widened). Octomap cells only clear when re-observed as free by a sensor
-    // ray, so old bad voxels can persist across mtc_node restarts even if move_group didn't restart.
-    auto clear_octomap_client = node->create_client<std_srvs::srv::Empty>("/clear_octomap");
-    RCLCPP_INFO(logger, "Waiting for /clear_octomap service...");
-    if (clear_octomap_client->wait_for_service(std::chrono::seconds(3))) {
-        auto clear_req = std::make_shared<std_srvs::srv::Empty::Request>();
-        auto clear_future = clear_octomap_client->async_send_request(clear_req);
-        if (clear_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
-            RCLCPP_INFO(logger, "Octomap cleared.");
+    void execute(const std::shared_ptr<GoalHandlePickPlace> goal_handle)
+    {
+        auto logger = this->get_logger();
+        auto node_ptr = shared_from_this();
+        auto goal = goal_handle->get_goal();
+        auto result = std::make_shared<PickPlace::Result>();
+
+        auto publishStage = [&](const std::string& stage) {
+            auto feedback = std::make_shared<PickPlace::Feedback>();
+            feedback->current_stage = stage;
+            goal_handle->publish_feedback(feedback);
+        };
+
+        auto abortWith = [&](const std::string& msg) {
+            RCLCPP_ERROR(logger, "%s", msg.c_str());
+            result->success = false;
+            result->message = msg;
+            goal_handle->abort(result);
+            goal_active_.store(false);
+        };
+
+        // See the class-level comment above for why this is still a literal
+        // for now rather than derived from which object was actually detected.
+        const std::string OBJECT_ID = "red_cube";
+
+        // ==========================================
+        // TWEAK THESE VALUES FOR TRIAL AND ERROR (unchanged from the original file)
+        // ==========================================
+        double CUBE_X_OFFSET = -0.005;
+        double CUBE_Y_OFFSET = 0.0;
+        double CUBE_Z_OFFSET = -0.055;
+
+        double GRIPPER_X_OFFSET = -0.0;
+        double GRIPPER_Y_OFFSET = -0.0275;
+        double GRIPPER_Z_OFFSET = 0.0275;
+
+        double DESCEND_DISTANCE = 0.05;
+        double LIFT_DISTANCE = 0.10;
+
+        double PLACE_APPROACH_CLEARANCE = 0.08;
+        double PLACE_DESCEND_DISTANCE = 0.08;
+
+        publishStage("initializing");
+
+        // ==========================================
+        // 1. INITIALIZE TASK AND ROBOT MODEL
+        // ==========================================
+        mtc::Task task("move_to_cube");
+        task.loadRobotModel(node_ptr);
+        auto robot_model = task.getRobotModel();
+
+        if (!robot_model) {
+            abortWith("Failed to load robot model");
+            return;
+        }
+
+        // ==========================================
+        // 2. GET CURRENT STATE DIRECTLY FROM TF/JOINT_STATES
+        // ==========================================
+        auto tf_buffer = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+        auto monitor = std::make_shared<planning_scene_monitor::CurrentStateMonitor>(
+            node_ptr, robot_model, tf_buffer, true);
+
+        RCLCPP_INFO(logger, "Waiting for robot state...");
+        monitor->waitForCompleteState("arm", 5.0);
+        monitor->waitForCompleteState("gripper", 5.0);
+        moveit::core::RobotStatePtr current_state = monitor->getCurrentState();
+
+        if (!current_state) {
+            abortWith("Failed to get current robot state");
+            return;
+        }
+
+        // Captured ONCE per goal, before any motion — every desired (fixed)
+        // orientation this run is anchored to this, never to a later/mutated state.
+        Eigen::Isometry3d initial_sp_pose     = current_state->getGlobalLinkTransform("shoulder_pan");
+        Eigen::Isometry3d initial_wrist2_pose = current_state->getGlobalLinkTransform("wrist_2");
+
+        auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node_ptr, "robot_description");
+        psm->startSceneMonitor();
+        psm->startWorldGeometryMonitor();
+        psm->startStateMonitor();
+
+        publishStage("clearing octomap");
+
+        // Force-clear any stale occupied voxels left from a previous goal or
+        // earlier testing. Octomap cells only clear when re-observed as free
+        // by a sensor ray, so old bad voxels could otherwise persist across goals.
+        auto clear_octomap_client = this->create_client<std_srvs::srv::Empty>("/clear_octomap");
+        RCLCPP_INFO(logger, "Waiting for /clear_octomap service...");
+        if (clear_octomap_client->wait_for_service(std::chrono::seconds(3))) {
+            auto clear_req = std::make_shared<std_srvs::srv::Empty::Request>();
+            auto clear_future = clear_octomap_client->async_send_request(clear_req);
+            if (clear_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+                RCLCPP_INFO(logger, "Octomap cleared.");
+            } else {
+                RCLCPP_WARN(logger, "/clear_octomap call timed out, continuing anyway.");
+            }
         } else {
-            RCLCPP_WARN(logger, "/clear_octomap call timed out, continuing anyway.");
+            RCLCPP_WARN(logger, "/clear_octomap service not available, skipping clear.");
         }
-    } else {
-        RCLCPP_WARN(logger, "/clear_octomap service not available, skipping clear.");
-    }
 
-    // Let the sensors rebuild the octomap cleanly (with current padding) before syncing.
-    rclcpp::sleep_for(std::chrono::seconds(3));
+        // Let the sensors rebuild the octomap cleanly before syncing.
+        rclcpp::sleep_for(std::chrono::seconds(3));
 
-    psm->requestPlanningSceneState("/get_planning_scene"); // blocking one-shot sync, don't start empty
+        psm->requestPlanningSceneState("/get_planning_scene");
 
-    Eigen::Isometry3d debug_sp = current_state->getGlobalLinkTransform("shoulder_pan");
-    RCLCPP_INFO(logger, "Shoulder Pan is at: x=%f, y=%f, z=%f",
-        debug_sp.translation().x(), debug_sp.translation().y(), debug_sp.translation().z());
+        Eigen::Isometry3d debug_sp = current_state->getGlobalLinkTransform("shoulder_pan");
+        RCLCPP_INFO(logger, "Shoulder Pan is at: x=%f, y=%f, z=%f",
+            debug_sp.translation().x(), debug_sp.translation().y(), debug_sp.translation().z());
 
-    // CAPTURE THE EXACT STARTING JOINTS HERE
-    std::vector<double> initial_joint_values;
-    current_state->copyJointGroupPositions("arm", initial_joint_values);
+        std::vector<double> initial_joint_values;
+        current_state->copyJointGroupPositions("arm", initial_joint_values);
 
-    // ==========================================
-    // 3. ADD FLOOR
-    // ==========================================
-    moveit::planning_interface::PlanningSceneInterface psi;
-    moveit_msgs::msg::CollisionObject floor;
-    // floor.id = "floor";
-    // floor.header.frame_id = robot_model->getModelFrame();
-    // floor.primitives.resize(1);
-    // floor.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    // floor.primitives[0].dimensions.resize(3);
-    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 2.0;
-    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 2.0;
-    // floor.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.1;
-    // floor.pose.position.x = 0.0;
-    // floor.pose.position.y = 0.0;
-    // floor.pose.position.z = -0.05;
-    // floor.pose.orientation.w = 1.0;
-    // floor.operation = moveit_msgs::msg::CollisionObject::ADD;
-    // psi.applyCollisionObject(floor);
+        // ==========================================
+        // 3. PICK POSE - comes straight from the goal now, no topic wait needed
+        // ==========================================
+        geometry_msgs::msg::Pose raw_pose = goal->pick_pose;
+        RCLCPP_INFO(logger, "Pick pose from goal -> x: %f, y: %f, z: %f",
+            raw_pose.position.x, raw_pose.position.y, raw_pose.position.z);
 
-    // ==========================================
-    // 4. WAIT FOR CUBE POSE
-    // ==========================================
-    geometry_msgs::msg::Pose raw_pose;
-    RCLCPP_INFO(logger, "Waiting for cube pose...");
-    while (rclcpp::ok() && !pose_received)
-    {
-        rclcpp::sleep_for(std::chrono::milliseconds(100));
-    }
+        // ==========================================
+        // 4. ADD CUBE TO PLANNING SCENE (RViz)
+        // ==========================================
+        geometry_msgs::msg::Pose cube_pose = raw_pose;
+        cube_pose.position.x += CUBE_X_OFFSET;
+        cube_pose.position.y += CUBE_Y_OFFSET;
+        cube_pose.position.z += CUBE_Z_OFFSET;
 
-    {
-        std::lock_guard<std::mutex> lock(pose_mutex);
-        raw_pose = latest_pose;
-    }
+        moveit::planning_interface::PlanningSceneInterface psi;
+        moveit_msgs::msg::CollisionObject cube;
+        cube.id = OBJECT_ID;
+        cube.header.frame_id = robot_model->getModelFrame();
+        cube.primitives.resize(1);
+        cube.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
+        cube.primitives[0].dimensions.resize(3);
+        cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 0.03;
+        cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 0.03;
+        cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.03;
+        cube.pose = cube_pose;
+        cube.operation = moveit_msgs::msg::CollisionObject::ADD;
+        psi.applyCollisionObject(cube);
 
-    RCLCPP_INFO(logger, "Received Cube Pose -> x: %f, y: %f, z: %f",
-        raw_pose.position.x, raw_pose.position.y, raw_pose.position.z);
+        std::vector<std::string> touch_links;
+        auto arm_links = robot_model->getJointModelGroup("arm")->getLinkModelNames();
+        auto gripper_links = robot_model->getJointModelGroup("gripper")->getLinkModelNames();
+        touch_links.insert(touch_links.end(), arm_links.begin(), arm_links.end());
+        touch_links.insert(touch_links.end(), gripper_links.begin(), gripper_links.end());
 
-    // ==========================================
-    // 4b. ADD CUBE TO PLANNING SCENE (RViz)
-    // ==========================================
-    geometry_msgs::msg::Pose cube_pose = raw_pose;
-    cube_pose.position.x += CUBE_X_OFFSET;
-    cube_pose.position.y += CUBE_Y_OFFSET;
-    cube_pose.position.z += CUBE_Z_OFFSET;
-
-    moveit_msgs::msg::CollisionObject cube;
-    cube.id = "red_cube";
-    cube.header.frame_id = robot_model->getModelFrame();
-    cube.primitives.resize(1);
-    cube.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    cube.primitives[0].dimensions.resize(3);
-    cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X] = 0.03;
-    cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y] = 0.03;
-    cube.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z] = 0.03;
-    cube.pose = cube_pose;
-    cube.operation = moveit_msgs::msg::CollisionObject::ADD;
-    psi.applyCollisionObject(cube);
-
-    // Build once, right after psi.applyCollisionObject(cube) — reuse everywhere below
-
-    std::vector<std::string> touch_links;
-    auto arm_links = robot_model->getJointModelGroup("arm")->getLinkModelNames();
-    auto gripper_links = robot_model->getJointModelGroup("gripper")->getLinkModelNames();
-    touch_links.insert(touch_links.end(), arm_links.begin(), arm_links.end());
-    touch_links.insert(touch_links.end(), gripper_links.begin(), gripper_links.end());
-
-    planning_scene::PlanningScenePtr ik_scene;
-    {
-        planning_scene_monitor::LockedPlanningSceneRO locked_scene(psm);
-        ik_scene = locked_scene->diff();
-    }
-    ik_scene->processCollisionObjectMsg(cube);
-
-    planning_scene::PlanningScenePtr grasp_scene = ik_scene->diff();
-    grasp_scene->getAllowedCollisionMatrixNonConst().setEntry("red_cube", touch_links, true);
-    grasp_scene->getAllowedCollisionMatrixNonConst().setEntry(
-        planning_scene::PlanningScene::OCTOMAP_NS, touch_links, true);
-
-    planning_scene::PlanningScenePtr transit_scene = ik_scene->diff();
-    moveit_msgs::msg::AttachedCollisionObject attached_cube_msg;
-    attached_cube_msg.link_name = "gripper";
-    attached_cube_msg.object = cube;
-    attached_cube_msg.object.operation = moveit_msgs::msg::CollisionObject::ADD;
-    attached_cube_msg.touch_links = touch_links;
-    transit_scene->processAttachedCollisionObjectMsg(attached_cube_msg);
-
-    // ==========================================
-    // APPLY OFFSET TO CUBE POSE FOR GRIPPER IK
-    // ==========================================
-    // Target represents where we want the GRIPPER to be
-    geometry_msgs::msg::Pose target = raw_pose;
-    target.position.z += GRIPPER_Z_OFFSET;
-    target.position.x += GRIPPER_X_OFFSET;
-    target.position.y += GRIPPER_Y_OFFSET;
-
-    // ==========================================
-    // 5-DOF IK CALCULATIONS
-    // ==========================================
-    // Every call below seeds from the pristine current_state — never from a previous
-    // IK result. This matches the very first working version's behavior exactly:
-    // each IK call independently re-derives joint_1 from current_state, so nothing
-    // downstream depends on the internal joint configuration a prior IK call landed on.
-    auto world_obj = ik_scene->getWorld()->getObject(planning_scene::PlanningScene::OCTOMAP_NS);
-    if (world_obj && !world_obj->shapes_.empty()) {
-        auto octree_shape = std::dynamic_pointer_cast<const shapes::OcTree>(world_obj->shapes_[0]);
-        if (octree_shape && octree_shape->octree) {
-            auto oct_node = octree_shape->octree->search(target.position.x, target.position.y, target.position.z);
-            bool occupied = oct_node && octree_shape->octree->isNodeOccupied(oct_node);
-            RCLCPP_INFO(logger, "Octomap synced OK. Target point (%.3f,%.3f,%.3f): %s",
-                        target.position.x, target.position.y, target.position.z,
-                        occupied ? "OCCUPIED" : "free");
+        planning_scene::PlanningScenePtr ik_scene;
+        {
+            planning_scene_monitor::LockedPlanningSceneRO locked_scene(psm);
+            ik_scene = locked_scene->diff();
         }
-    } else {
-        RCLCPP_WARN(logger, "ik_scene has NO octomap object — requestPlanningSceneState didn't pull it in.");
-    }
+        ik_scene->processCollisionObjectMsg(cube);
 
-    // --- PICK LEG ---
+        planning_scene::PlanningScenePtr grasp_scene = ik_scene->diff();
+        grasp_scene->getAllowedCollisionMatrixNonConst().setEntry(OBJECT_ID, touch_links, true);
+        grasp_scene->getAllowedCollisionMatrixNonConst().setEntry(
+            planning_scene::PlanningScene::OCTOMAP_NS, touch_links, true);
 
-    // 1. Free-orientation move to the pre-grasp pose.
-    std::vector<double> joint_values;
-    Eigen::Quaterniond achieved_grasp_orientation;
-    if (!computeFreeOrientationIK(current_state.get(), ik_scene, logger,
-                                   target.position.x, target.position.y, target.position.z,
-                                   joint_values, achieved_grasp_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
+        planning_scene::PlanningScenePtr transit_scene = ik_scene->diff();
+        moveit_msgs::msg::AttachedCollisionObject attached_cube_msg;
+        attached_cube_msg.link_name = "gripper";
+        attached_cube_msg.object = cube;
+        attached_cube_msg.object.operation = moveit_msgs::msg::CollisionObject::ADD;
+        attached_cube_msg.touch_links = touch_links;
+        transit_scene->processAttachedCollisionObjectMsg(attached_cube_msg);
 
-    // 2. Fix orientation in place: same (x,y,z), snap back to the canonical
-    //    grasp-facing orientation. Seeded from Free-Orientation IK's OWN landed
-    //    state (same x,y,z) — position is already solved there, so this becomes a
-    //    local orientation correction instead of resolving the whole reach from
-    //    scratch against a far-away seed. computeFixedOrientationIK still
-    //    re-derives joint_1 internally regardless of what seed it's given, so this
-    //    doesn't reintroduce the earlier seed-contamination issue.
-    Eigen::Quaterniond desired_grasp_orientation =
-        computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose,
-                                        target.position.x, target.position.y);
+        // ==========================================
+        // APPLY OFFSET TO CUBE POSE FOR GRIPPER IK
+        // ==========================================
+        geometry_msgs::msg::Pose target = raw_pose;
+        target.position.z += GRIPPER_Z_OFFSET;
+        target.position.x += GRIPPER_X_OFFSET;
+        target.position.y += GRIPPER_Y_OFFSET;
 
-    moveit::core::RobotState free_grasp_state(*current_state);
-    free_grasp_state.setJointGroupPositions("arm", joint_values);
-    free_grasp_state.update();
-
-    std::vector<double> fix_orientation_grasp_joint_values;
-    Eigen::Quaterniond achieved_grasp_fixed_orientation;
-    if (!computeFixedOrientationIK(&free_grasp_state, ik_scene, logger,
-                                    target.position.x, target.position.y, target.position.z,
-                                    desired_grasp_orientation,
-                                    fix_orientation_grasp_joint_values,
-                                    achieved_grasp_fixed_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // 3. Descend to grasp — fixed orientation, vertical only. Reuses whatever
-    //    orientation was actually achieved just above (same x,y, only z differs) —
-    //    already proven reachable at this column — instead of re-deriving the
-    //    idealized analytic orientation, which may not be exactly reachable here.
-    double grasp_x = target.position.x;
-    double grasp_y = target.position.y;
-    double grasp_z = target.position.z - DESCEND_DISTANCE;
-
-    std::vector<double> grasp_joint_values;
-    Eigen::Quaterniond achieved_descend_orientation;
-    if (!computeFixedOrientationIK(current_state.get(), grasp_scene, logger,
-                                    grasp_x, grasp_y, grasp_z,
-                                    achieved_grasp_fixed_orientation,
-                                    grasp_joint_values,
-                                    achieved_descend_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // 4. Lift — fixed orientation, vertical only. Same reasoning: build on the
-    //    orientation just proven reachable at the grasp point.
-    double lift_x = grasp_x;
-    double lift_y = grasp_y;
-    double lift_z = grasp_z + LIFT_DISTANCE;
-
-    std::vector<double> lift_joint_values;
-    Eigen::Quaterniond achieved_lift_orientation;
-    if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
-                                    lift_x, lift_y, lift_z,
-                                    achieved_descend_orientation,
-                                    lift_joint_values,
-                                    achieved_lift_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // --- PLACE LEG ---
-
-    // 5. Free-orientation move to the place-approach pose.
-    double place_x = -0.13;
-    double place_y = 0.3 - 0.025;
-    double place_approach_z = lift_z + PLACE_APPROACH_CLEARANCE;
-
-    std::vector<double> place_approach_joint_values;
-    Eigen::Quaterniond achieved_place_orientation;
-    if (!computeFreeOrientationIK(current_state.get(), transit_scene, logger,
-                                   place_x, place_y, place_approach_z,
-                                   place_approach_joint_values, achieved_place_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // 6. Fix orientation in place at the place-approach point. Same reasoning as
-    //    the grasp side: seed from Free-Orientation IK's own landed state so this
-    //    is a local orientation correction, not a from-scratch reach+orientation solve.
-    Eigen::Quaterniond desired_place_orientation =
-        computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose, place_x, place_y);
-
-    moveit::core::RobotState free_place_state(*current_state);
-    free_place_state.setJointGroupPositions("arm", place_approach_joint_values);
-    free_place_state.update();
-
-    std::vector<double> fix_orientation_place_joint_values;
-    Eigen::Quaterniond achieved_place_fixed_orientation;
-    if (!computeFixedOrientationIK(&free_place_state, transit_scene, logger,
-                                    place_x, place_y, place_approach_z,
-                                    desired_place_orientation,
-                                    fix_orientation_place_joint_values,
-                                    achieved_place_fixed_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // 7. Descend to place — fixed orientation, vertical only. Same column, so reuse
-    //    the orientation just proven reachable at the place-approach point.
-    double place_z = place_approach_z - PLACE_DESCEND_DISTANCE;
-
-    std::vector<double> place_joint_values;
-    Eigen::Quaterniond achieved_place_descend_orientation;
-    if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
-                                    place_x, place_y, place_z,
-                                    achieved_place_fixed_orientation,
-                                    place_joint_values,
-                                    achieved_place_descend_orientation)) {
-        executor.cancel(); spinner.join(); rclcpp::shutdown(); return 1;
-    }
-
-    // Fetch joint names for MTC setup
-    const moveit::core::JointModelGroup* jmg = current_state->getJointModelGroup("arm");
-    const std::vector<std::string>& joint_names = jmg->getVariableNames();
-
-    // ==========================================
-    // MOVEIT TASK CONSTRUCTOR SETUP
-    // ==========================================
-
-    auto pipeline = std::make_shared<mtc::solvers::PipelinePlanner>(node);
-    pipeline->setProperty("max_velocity_scaling_factor", 0.2);
-    pipeline->setProperty("max_acceleration_scaling_factor", 0.2);
-
-    auto gripper_pipeline = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-    gripper_pipeline->setMaxVelocityScalingFactor(0.1);
-    gripper_pipeline->setMaxAccelerationScalingFactor(0.1);
-
-    // Stage 1: Fixed Current State — reuse the same synced snapshot the IK used
-    planning_scene::PlanningScenePtr scene = ik_scene;
-
-    RCLCPP_INFO(logger, "Scene world objects: %zu | has octomap: %s",
-        scene->getWorld()->size(),
-        scene->getWorld()->hasObject(planning_scene::PlanningScene::OCTOMAP_NS) ? "yes" : "no");
-
-    moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
-    scene_state = *current_state;
-
-    double safe_zero = 0.0;
-    scene_state.setJointPositions("wrist_2_gripper_joint", &safe_zero);
-    // cube already applied to ik_scene above — don't re-add it here
-
-    scene->processCollisionObjectMsg(cube);
-
-    auto current_stage = std::make_unique<mtc::stages::FixedState>("current state");
-    current_stage->setState(scene);
-    task.add(std::move(current_stage));
-
-    // Stage 1.5: Allow Collision with Cube (EARLY!)
-    auto allow_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper collision");
-    allow_coll->allowCollisions("red_cube", touch_links, true);
-    task.add(std::move(allow_coll));
-
-    // Stage 4: Rotate Wrist 90 Degrees
-    auto rotate_wrist = std::make_unique<mtc::stages::MoveRelative>("rotate wrist", pipeline);
-    rotate_wrist->setGroup("arm");
-    std::map<std::string, double> joint_deltas;
-    joint_deltas["wrist_1_wrist_2_joint"] = M_PI / 2.0;
-    rotate_wrist->setDirection(joint_deltas);
-    rotate_wrist->setProperty("timeout", 10.0);
-    task.add(std::move(rotate_wrist));
-
-    // Stage 3: Move Arm to Target Joints
-    auto move_to = std::make_unique<mtc::stages::MoveTo>("move to target", pipeline);
-    move_to->setGroup("arm");
-    std::map<std::string, double> joint_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        joint_targets[joint_names[i]] = joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            joint_targets[joint_names[i]] += M_PI / 2.0;
+        // ==========================================
+        // 5-DOF IK CALCULATIONS
+        // ==========================================
+        auto world_obj = ik_scene->getWorld()->getObject(planning_scene::PlanningScene::OCTOMAP_NS);
+        if (world_obj && !world_obj->shapes_.empty()) {
+            auto octree_shape = std::dynamic_pointer_cast<const shapes::OcTree>(world_obj->shapes_[0]);
+            if (octree_shape && octree_shape->octree) {
+                auto oct_node = octree_shape->octree->search(target.position.x, target.position.y, target.position.z);
+                bool occupied = oct_node && octree_shape->octree->isNodeOccupied(oct_node);
+                RCLCPP_INFO(logger, "Octomap synced OK. Target point (%.3f,%.3f,%.3f): %s",
+                            target.position.x, target.position.y, target.position.z,
+                            occupied ? "OCCUPIED" : "free");
+            }
+        } else {
+            RCLCPP_WARN(logger, "ik_scene has NO octomap object — requestPlanningSceneState didn't pull it in.");
         }
-    }
-    move_to->setGoal(joint_targets);
-    move_to->setProperty("timeout", 10.0);
-    task.add(std::move(move_to));
 
-    // Stage 3.5: Fix Orientation — snap the wrist back to the canonical grasp-facing
-    // orientation now that we're at the right position.
-    auto fix_orientation_grasp = std::make_unique<mtc::stages::MoveTo>("fix orientation (grasp)", pipeline);
-    fix_orientation_grasp->setGroup("arm");
-    std::map<std::string, double> fix_orientation_grasp_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        fix_orientation_grasp_targets[joint_names[i]] = fix_orientation_grasp_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            fix_orientation_grasp_targets[joint_names[i]] += M_PI / 2.0;
+        publishStage("computing pick IK");
+
+        // --- PICK LEG ---
+
+        std::vector<double> joint_values;
+        Eigen::Quaterniond achieved_grasp_orientation;
+        if (!computeFreeOrientationIK(current_state.get(), ik_scene, logger,
+                                       target.position.x, target.position.y, target.position.z,
+                                       joint_values, achieved_grasp_orientation)) {
+            abortWith("Free-orientation IK failed for pick pose");
+            return;
         }
-    }
-    fix_orientation_grasp->setGoal(fix_orientation_grasp_targets);
-    fix_orientation_grasp->setProperty("timeout", 10.0);
-    task.add(std::move(fix_orientation_grasp));
 
-    // Stage 2: Open Gripper
-    auto open_gripper = std::make_unique<mtc::stages::MoveTo>("open gripper", gripper_pipeline);
-    open_gripper->setGroup("gripper");
-    std::map<std::string, double> gripper_open;
-    gripper_open["wrist_2_gripper_joint"] = 1.0;
-    open_gripper->setGoal(gripper_open);
-    open_gripper->setProperty("timeout", 5.0);
-    task.add(std::move(open_gripper));
+        Eigen::Quaterniond desired_grasp_orientation =
+            computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose,
+                                            target.position.x, target.position.y);
 
-    // Stage 4.5: Allow collision with octomap voxels local to the grasp (cube self-perception)
-    auto allow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper-octomap collision");
-    std::vector<std::string> octomap_allow_list = touch_links;
-    octomap_allow_list.push_back("red_cube");  // camera sees the cube too — same voxels as the object
-    allow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_allow_list, true);
-    task.add(std::move(allow_octomap_coll));
+        moveit::core::RobotState free_grasp_state(*current_state);
+        free_grasp_state.setJointGroupPositions("arm", joint_values);
+        free_grasp_state.update();
 
-    // Stage 5: Descend to Cube (Joint Space)
-    auto descend = std::make_unique<mtc::stages::MoveTo>("descend to cube", pipeline);
-    descend->setGroup("arm");
-    std::map<std::string, double> grasp_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        grasp_targets[joint_names[i]] = grasp_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            grasp_targets[joint_names[i]] += M_PI / 2.0;
+        std::vector<double> fix_orientation_grasp_joint_values;
+        Eigen::Quaterniond achieved_grasp_fixed_orientation;
+        if (!computeFixedOrientationIK(&free_grasp_state, ik_scene, logger,
+                                        target.position.x, target.position.y, target.position.z,
+                                        desired_grasp_orientation,
+                                        fix_orientation_grasp_joint_values,
+                                        achieved_grasp_fixed_orientation)) {
+            abortWith("Fixed-orientation IK failed at pick pose");
+            return;
         }
-    }
-    descend->setGoal(grasp_targets);
-    descend->setProperty("timeout", 10.0);
-    task.add(std::move(descend));
 
-    // Stage 6: Close Gripper
-    auto close_gripper = std::make_unique<mtc::stages::MoveTo>("close gripper", gripper_pipeline);
-    close_gripper->setGroup("gripper");
-    std::map<std::string, double> gripper_close;
-    gripper_close["wrist_2_gripper_joint"] = 0.475;
-    close_gripper->setGoal(gripper_close);
-    close_gripper->setProperty("timeout", 5.0);
-    task.add(std::move(close_gripper));
+        double grasp_x = target.position.x;
+        double grasp_y = target.position.y;
+        double grasp_z = target.position.z - DESCEND_DISTANCE;
 
-    // Stage 7: Attach Cube to Gripper
-    auto attach_cube = std::make_unique<mtc::stages::ModifyPlanningScene>("attach cube");
-    attach_cube->attachObject("red_cube", "gripper");
-    task.add(std::move(attach_cube));
-
-    // Stage 8: Lift Up (Joint Space)
-    auto lift = std::make_unique<mtc::stages::MoveTo>("lift up", pipeline);
-    lift->setGroup("arm");
-    std::map<std::string, double> lift_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        lift_targets[joint_names[i]] = lift_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            lift_targets[joint_names[i]] += M_PI / 2.0;
+        std::vector<double> grasp_joint_values;
+        Eigen::Quaterniond achieved_descend_orientation;
+        if (!computeFixedOrientationIK(current_state.get(), grasp_scene, logger,
+                                        grasp_x, grasp_y, grasp_z,
+                                        achieved_grasp_fixed_orientation,
+                                        grasp_joint_values,
+                                        achieved_descend_orientation)) {
+            abortWith("Fixed-orientation IK failed for descend-to-grasp");
+            return;
         }
-    }
-    lift->setGoal(lift_targets);
-    lift->setProperty("timeout", 10.0);
-    task.add(std::move(lift));
 
-    // Stage 8.5: Re-disallow octomap collision now that we're clear of the pickup zone
-    auto disallow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("disallow gripper-octomap collision");
-    std::vector<std::string> octomap_disallow_list = touch_links;
-    octomap_disallow_list.push_back("red_cube");
-    disallow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_disallow_list, false);
-    task.add(std::move(disallow_octomap_coll));
+        double lift_x = grasp_x;
+        double lift_y = grasp_y;
+        double lift_z = grasp_z + LIFT_DISTANCE;
 
-    // ==========================================
-    // Stage 9: Move to Place Location (approach height — clears the wall)
-    // ==========================================
-    auto move_to_place = std::make_unique<mtc::stages::MoveTo>("move to place", pipeline);
-    move_to_place->setGroup("arm");
-    std::map<std::string, double> place_approach_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        place_approach_targets[joint_names[i]] = place_approach_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            place_approach_targets[joint_names[i]] += M_PI / 2.0;
+        std::vector<double> lift_joint_values;
+        Eigen::Quaterniond achieved_lift_orientation;
+        if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
+                                        lift_x, lift_y, lift_z,
+                                        achieved_descend_orientation,
+                                        lift_joint_values,
+                                        achieved_lift_orientation)) {
+            abortWith("Fixed-orientation IK failed for lift");
+            return;
         }
-    }
-    move_to_place->setGoal(place_approach_targets);
-    move_to_place->setProperty("timeout", 10.0);
-    task.add(std::move(move_to_place));
 
-    // ==========================================
-    // Stage 9.4: Fix Orientation — snap the wrist back to the canonical place-facing
-    // orientation now that we're at the place-approach position.
-    // ==========================================
-    auto fix_orientation_place = std::make_unique<mtc::stages::MoveTo>("fix orientation (place)", pipeline);
-    fix_orientation_place->setGroup("arm");
-    std::map<std::string, double> fix_orientation_place_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        fix_orientation_place_targets[joint_names[i]] = fix_orientation_place_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            fix_orientation_place_targets[joint_names[i]] += M_PI / 2.0;
+        publishStage("computing place IK");
+
+        // --- PLACE LEG ---
+        // x,y come from the goal's place_pose. z is intentionally still derived
+        // from lift_z (matches the original hand-tuned behavior) rather than
+        // goal->place_pose.position.z - see the class-level comment for why.
+        double place_x = goal->place_pose.position.x;
+        double place_y = goal->place_pose.position.y;
+        double place_approach_z = lift_z + PLACE_APPROACH_CLEARANCE;
+
+        std::vector<double> place_approach_joint_values;
+        Eigen::Quaterniond achieved_place_orientation;
+        if (!computeFreeOrientationIK(current_state.get(), transit_scene, logger,
+                                       place_x, place_y, place_approach_z,
+                                       place_approach_joint_values, achieved_place_orientation)) {
+            abortWith("Free-orientation IK failed for place-approach pose");
+            return;
         }
-    }
-    fix_orientation_place->setGoal(fix_orientation_place_targets);
-    fix_orientation_place->setProperty("timeout", 10.0);
-    task.add(std::move(fix_orientation_place));
 
-    // ==========================================
-    // Stage 9.5: Descend to Place Surface (now clear of the wall)
-    // ==========================================
-    auto descend_to_place = std::make_unique<mtc::stages::MoveTo>("descend to place", pipeline);
-    descend_to_place->setGroup("arm");
-    std::map<std::string, double> place_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        place_targets[joint_names[i]] = place_joint_values[i];
-        if (joint_names[i] == "wrist_1_wrist_2_joint") {
-            place_targets[joint_names[i]] += M_PI / 2.0;
+        Eigen::Quaterniond desired_place_orientation =
+            computeDesiredWristOrientation(initial_sp_pose, initial_wrist2_pose, place_x, place_y);
+
+        moveit::core::RobotState free_place_state(*current_state);
+        free_place_state.setJointGroupPositions("arm", place_approach_joint_values);
+        free_place_state.update();
+
+        std::vector<double> fix_orientation_place_joint_values;
+        Eigen::Quaterniond achieved_place_fixed_orientation;
+        if (!computeFixedOrientationIK(&free_place_state, transit_scene, logger,
+                                        place_x, place_y, place_approach_z,
+                                        desired_place_orientation,
+                                        fix_orientation_place_joint_values,
+                                        achieved_place_fixed_orientation)) {
+            abortWith("Fixed-orientation IK failed at place-approach pose");
+            return;
         }
-    }
-    descend_to_place->setGoal(place_targets);
-    descend_to_place->setProperty("timeout", 10.0);
-    task.add(std::move(descend_to_place));
 
-    // ==========================================
-    // Stage 10: Open Gripper to Release
-    // ==========================================
-    auto open_gripper_place = std::make_unique<mtc::stages::MoveTo>("open gripper place", gripper_pipeline);
-    open_gripper_place->setGroup("gripper");
-    std::map<std::string, double> gripper_open_place;
-    gripper_open_place["wrist_2_gripper_joint"] = 1.0;
-    open_gripper_place->setGoal(gripper_open_place);
-    open_gripper_place->setProperty("timeout", 5.0);
-    task.add(std::move(open_gripper_place));
+        double place_z = place_approach_z - PLACE_DESCEND_DISTANCE;
 
-    // ==========================================
-    // Stage 11: Detach Cube
-    // ==========================================
-    auto detach_cube = std::make_unique<mtc::stages::ModifyPlanningScene>("detach cube");
-    detach_cube->detachObject("red_cube", "gripper");
-    task.add(std::move(detach_cube));
+        std::vector<double> place_joint_values;
+        Eigen::Quaterniond achieved_place_descend_orientation;
+        if (!computeFixedOrientationIK(current_state.get(), transit_scene, logger,
+                                        place_x, place_y, place_z,
+                                        achieved_place_fixed_orientation,
+                                        place_joint_values,
+                                        achieved_place_descend_orientation)) {
+            abortWith("Fixed-orientation IK failed for descend-to-place");
+            return;
+        }
 
-    // ==========================================
-    // Stage 12: Return to Start Position
-    // ==========================================
-    // Move back to the exact joint positions the robot was in when the node started.
-    auto return_to_start = std::make_unique<mtc::stages::MoveTo>("return to start", pipeline);
-    return_to_start->setGroup("arm");
+        const moveit::core::JointModelGroup* jmg = current_state->getJointModelGroup("arm");
+        const std::vector<std::string>& joint_names = jmg->getVariableNames();
 
-    std::map<std::string, double> start_targets;
-    for (size_t i = 0; i < joint_names.size(); ++i) {
-        start_targets[joint_names[i]] = initial_joint_values[i];
-    }
-    return_to_start->setGoal(start_targets);
-    return_to_start->setProperty("timeout", 10.0);
-    task.add(std::move(return_to_start));
+        // ==========================================
+        // MOVEIT TASK CONSTRUCTOR SETUP (unchanged from the original file
+        // aside from using OBJECT_ID instead of repeating "red_cube")
+        // ==========================================
+        auto pipeline = std::make_shared<mtc::solvers::PipelinePlanner>(node_ptr);
+        pipeline->setProperty("max_velocity_scaling_factor", 0.2);
+        pipeline->setProperty("max_acceleration_scaling_factor", 0.2);
 
-    // ==========================================
-    // Stage 13: Close Gripper at End
-    // ==========================================
-    auto close_gripper_final = std::make_unique<mtc::stages::MoveTo>("close gripper final", gripper_pipeline);
-    close_gripper_final->setGroup("gripper");
-    std::map<std::string, double> gripper_close_final;
-    gripper_close_final["wrist_2_gripper_joint"] = 0.0; // Close completely
-    close_gripper_final->setGoal(gripper_close_final);
-    close_gripper_final->setProperty("timeout", 5.0);
-    task.add(std::move(close_gripper_final));
+        auto gripper_pipeline = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+        gripper_pipeline->setMaxVelocityScalingFactor(0.1);
+        gripper_pipeline->setMaxAccelerationScalingFactor(0.1);
 
-    // ==========================================
-    // PLAN & EXECUTE
-    // ==========================================
-    RCLCPP_INFO(logger, "Planning with MTC...");
-    auto result = task.plan(1);
+        planning_scene::PlanningScenePtr scene = ik_scene;
 
-    if (result == moveit::core::MoveItErrorCode::SUCCESS)
-    {
+        RCLCPP_INFO(logger, "Scene world objects: %zu | has octomap: %s",
+            scene->getWorld()->size(),
+            scene->getWorld()->hasObject(planning_scene::PlanningScene::OCTOMAP_NS) ? "yes" : "no");
+
+        moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
+        scene_state = *current_state;
+
+        double safe_zero = 0.0;
+        scene_state.setJointPositions("wrist_2_gripper_joint", &safe_zero);
+
+        scene->processCollisionObjectMsg(cube);
+
+        auto current_stage_mtc = std::make_unique<mtc::stages::FixedState>("current state");
+        current_stage_mtc->setState(scene);
+        task.add(std::move(current_stage_mtc));
+
+        auto allow_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper collision");
+        allow_coll->allowCollisions(OBJECT_ID, touch_links, true);
+        task.add(std::move(allow_coll));
+
+        auto rotate_wrist = std::make_unique<mtc::stages::MoveRelative>("rotate wrist", pipeline);
+        rotate_wrist->setGroup("arm");
+        std::map<std::string, double> joint_deltas;
+        joint_deltas["wrist_1_wrist_2_joint"] = M_PI / 2.0;
+        rotate_wrist->setDirection(joint_deltas);
+        rotate_wrist->setProperty("timeout", 10.0);
+        task.add(std::move(rotate_wrist));
+
+        auto move_to = std::make_unique<mtc::stages::MoveTo>("move to target", pipeline);
+        move_to->setGroup("arm");
+        std::map<std::string, double> joint_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            joint_targets[joint_names[i]] = joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                joint_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        move_to->setGoal(joint_targets);
+        move_to->setProperty("timeout", 10.0);
+        task.add(std::move(move_to));
+
+        auto fix_orientation_grasp = std::make_unique<mtc::stages::MoveTo>("fix orientation (grasp)", pipeline);
+        fix_orientation_grasp->setGroup("arm");
+        std::map<std::string, double> fix_orientation_grasp_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            fix_orientation_grasp_targets[joint_names[i]] = fix_orientation_grasp_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                fix_orientation_grasp_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        fix_orientation_grasp->setGoal(fix_orientation_grasp_targets);
+        fix_orientation_grasp->setProperty("timeout", 10.0);
+        task.add(std::move(fix_orientation_grasp));
+
+        auto open_gripper = std::make_unique<mtc::stages::MoveTo>("open gripper", gripper_pipeline);
+        open_gripper->setGroup("gripper");
+        std::map<std::string, double> gripper_open;
+        gripper_open["wrist_2_gripper_joint"] = 1.0;
+        open_gripper->setGoal(gripper_open);
+        open_gripper->setProperty("timeout", 5.0);
+        task.add(std::move(open_gripper));
+
+        auto allow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper-octomap collision");
+        std::vector<std::string> octomap_allow_list = touch_links;
+        octomap_allow_list.push_back(OBJECT_ID);
+        allow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_allow_list, true);
+        task.add(std::move(allow_octomap_coll));
+
+        auto descend = std::make_unique<mtc::stages::MoveTo>("descend to cube", pipeline);
+        descend->setGroup("arm");
+        std::map<std::string, double> grasp_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            grasp_targets[joint_names[i]] = grasp_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                grasp_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        descend->setGoal(grasp_targets);
+        descend->setProperty("timeout", 10.0);
+        task.add(std::move(descend));
+
+        auto close_gripper = std::make_unique<mtc::stages::MoveTo>("close gripper", gripper_pipeline);
+        close_gripper->setGroup("gripper");
+        std::map<std::string, double> gripper_close;
+        gripper_close["wrist_2_gripper_joint"] = 0.475;
+        close_gripper->setGoal(gripper_close);
+        close_gripper->setProperty("timeout", 5.0);
+        task.add(std::move(close_gripper));
+
+        auto attach_cube = std::make_unique<mtc::stages::ModifyPlanningScene>("attach cube");
+        attach_cube->attachObject(OBJECT_ID, "gripper");
+        task.add(std::move(attach_cube));
+
+        auto lift = std::make_unique<mtc::stages::MoveTo>("lift up", pipeline);
+        lift->setGroup("arm");
+        std::map<std::string, double> lift_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            lift_targets[joint_names[i]] = lift_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                lift_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        lift->setGoal(lift_targets);
+        lift->setProperty("timeout", 10.0);
+        task.add(std::move(lift));
+
+        auto disallow_octomap_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("disallow gripper-octomap collision");
+        std::vector<std::string> octomap_disallow_list = touch_links;
+        octomap_disallow_list.push_back(OBJECT_ID);
+        disallow_octomap_coll->allowCollisions(planning_scene::PlanningScene::OCTOMAP_NS, octomap_disallow_list, false);
+        task.add(std::move(disallow_octomap_coll));
+
+        auto move_to_place = std::make_unique<mtc::stages::MoveTo>("move to place", pipeline);
+        move_to_place->setGroup("arm");
+        std::map<std::string, double> place_approach_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            place_approach_targets[joint_names[i]] = place_approach_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                place_approach_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        move_to_place->setGoal(place_approach_targets);
+        move_to_place->setProperty("timeout", 10.0);
+        task.add(std::move(move_to_place));
+
+        auto fix_orientation_place = std::make_unique<mtc::stages::MoveTo>("fix orientation (place)", pipeline);
+        fix_orientation_place->setGroup("arm");
+        std::map<std::string, double> fix_orientation_place_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            fix_orientation_place_targets[joint_names[i]] = fix_orientation_place_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                fix_orientation_place_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        fix_orientation_place->setGoal(fix_orientation_place_targets);
+        fix_orientation_place->setProperty("timeout", 10.0);
+        task.add(std::move(fix_orientation_place));
+
+        auto descend_to_place = std::make_unique<mtc::stages::MoveTo>("descend to place", pipeline);
+        descend_to_place->setGroup("arm");
+        std::map<std::string, double> place_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            place_targets[joint_names[i]] = place_joint_values[i];
+            if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                place_targets[joint_names[i]] += M_PI / 2.0;
+            }
+        }
+        descend_to_place->setGoal(place_targets);
+        descend_to_place->setProperty("timeout", 10.0);
+        task.add(std::move(descend_to_place));
+
+        auto open_gripper_place = std::make_unique<mtc::stages::MoveTo>("open gripper place", gripper_pipeline);
+        open_gripper_place->setGroup("gripper");
+        std::map<std::string, double> gripper_open_place;
+        gripper_open_place["wrist_2_gripper_joint"] = 1.0;
+        open_gripper_place->setGoal(gripper_open_place);
+        open_gripper_place->setProperty("timeout", 5.0);
+        task.add(std::move(open_gripper_place));
+
+        auto detach_cube = std::make_unique<mtc::stages::ModifyPlanningScene>("detach cube");
+        detach_cube->detachObject(OBJECT_ID, "gripper");
+        task.add(std::move(detach_cube));
+
+        auto return_to_start = std::make_unique<mtc::stages::MoveTo>("return to start", pipeline);
+        return_to_start->setGroup("arm");
+        std::map<std::string, double> start_targets;
+        for (size_t i = 0; i < joint_names.size(); ++i) {
+            start_targets[joint_names[i]] = initial_joint_values[i];
+        }
+        return_to_start->setGoal(start_targets);
+        return_to_start->setProperty("timeout", 10.0);
+        task.add(std::move(return_to_start));
+
+        auto close_gripper_final = std::make_unique<mtc::stages::MoveTo>("close gripper final", gripper_pipeline);
+        close_gripper_final->setGroup("gripper");
+        std::map<std::string, double> gripper_close_final;
+        gripper_close_final["wrist_2_gripper_joint"] = 0.0;
+        close_gripper_final->setGoal(gripper_close_final);
+        close_gripper_final->setProperty("timeout", 5.0);
+        task.add(std::move(close_gripper_final));
+
+        // ==========================================
+        // PLAN & EXECUTE
+        // ==========================================
+        publishStage("planning");
+        RCLCPP_INFO(logger, "Planning with MTC...");
+        auto plan_result = task.plan(1);
+
+        if (plan_result != moveit::core::MoveItErrorCode::SUCCESS) {
+            abortWith("MTC planning failed");
+            return;
+        }
+
         RCLCPP_INFO(logger, "MTC Planning SUCCESS! Extracting trajectory...");
 
         using moveit::planning_interface::MoveGroupInterface;
-        MoveGroupInterface arm_group(node, "arm");
-        MoveGroupInterface gripper_group(node, "gripper");
+        MoveGroupInterface arm_group(node_ptr, "arm");
+        MoveGroupInterface gripper_group(node_ptr, "gripper");
         arm_group.startStateMonitor();
         gripper_group.startStateMonitor();
+
+        // ==========================================
+        // CORRECTIVE POSITION CHECK - one retry, at two checkpoints
+        //
+        // Checked against the "gripper" link, NOT "wrist_2". Every x/y/z
+        // this file passes into computeFreeOrientationIK/
+        // computeFixedOrientationIK (target, grasp_x/y/z, place_x/y/z) is
+        // already a GRIPPER position - see "APPLY OFFSET TO CUBE POSE FOR
+        // GRIPPER IK" above, where GRIPPER_X/Y/Z_OFFSET get added on top of
+        // the raw detected pose. The IK functions solve for wrist_2
+        // internally (target_pos = xyz - orientation * w2_to_grip_vec) so
+        // that the GRIPPER, not wrist_2, ends up at the requested point.
+        // Checking wrist_2 here would be measuring the wrong link by
+        // exactly that fixed offset.
+        //
+        // One corrective attempt only: re-seed IK from the arm's ACTUAL
+        // current state (not the original seed), solve for the same
+        // target position + the same orientation that checkpoint was
+        // already aiming for, then command that as a single move. If
+        // it's still off afterward, abort rather than push on from a
+        // known-bad position.
+        // ==========================================
+        const double CORRECTION_THRESHOLD = 0.01;  // 1cm
+
+        auto verifyAndCorrect = [&](const std::string& label,
+                                     double x, double y, double z,
+                                     const Eigen::Quaterniond& desired_orientation,
+                                     const planning_scene::PlanningSceneConstPtr& scene) -> bool
+        {
+            moveit::core::RobotStatePtr live_state;
+            {
+                rclcpp::Time check_time = this->now();
+                if (!monitor->waitForCurrentState(check_time, 1.0)) {
+                    RCLCPP_WARN(logger, "[%s check] Timed out waiting for a fresh robot state - using best available", label.c_str());
+                }
+                live_state = monitor->getCurrentState();
+            }
+            if (!live_state) {
+                RCLCPP_WARN(logger, "[%s check] Couldn't get a fresh robot state - skipping check", label.c_str());
+                return true;  // don't block the task over a monitor hiccup
+            }
+
+            Eigen::Vector3d target_vec(x, y, z);
+            Eigen::Vector3d actual = live_state->getGlobalLinkTransform("gripper").translation();
+            double error = (actual - target_vec).norm();
+
+            RCLCPP_INFO(logger, "[%s check] Gripper is %.1fmm from target (%.3f, %.3f, %.3f)",
+                        label.c_str(), error * 1000.0, x, y, z);
+
+            if (error <= CORRECTION_THRESHOLD) {
+                return true;
+            }
+
+            RCLCPP_WARN(logger, "[%s check] Off by %.1fmm (tolerance %.1fmm) - attempting ONE corrective move",
+                        label.c_str(), error * 1000.0, CORRECTION_THRESHOLD * 1000.0);
+
+            std::vector<double> corrective_joint_values;
+            Eigen::Quaterniond corrective_achieved_orientation;
+            if (!computeFixedOrientationIK(live_state.get(), scene, logger, x, y, z,
+                                            desired_orientation, corrective_joint_values,
+                                            corrective_achieved_orientation)) {
+                RCLCPP_ERROR(logger, "[%s check] Corrective IK failed - giving up on this checkpoint", label.c_str());
+                return false;
+            }
+
+            std::map<std::string, double> corrective_targets;
+            for (size_t i = 0; i < joint_names.size(); ++i) {
+                corrective_targets[joint_names[i]] = corrective_joint_values[i];
+                if (joint_names[i] == "wrist_1_wrist_2_joint") {
+                    corrective_targets[joint_names[i]] += M_PI / 2.0;
+                }
+            }
+
+            arm_group.setJointValueTarget(corrective_targets);
+            moveit::core::MoveItErrorCode move_result = arm_group.move();
+            if (move_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                RCLCPP_ERROR(logger, "[%s check] Corrective move failed to execute (error code %d)",
+                             label.c_str(), move_result.val);
+                return false;
+            }
+
+            moveit::core::RobotStatePtr corrected_state;
+            {
+                rclcpp::Time recheck_time = this->now();
+                if (!monitor->waitForCurrentState(recheck_time, 1.0)) {
+                    RCLCPP_WARN(logger, "[%s check] Timed out waiting for a fresh post-correction state - using best available", label.c_str());
+                }
+                corrected_state = monitor->getCurrentState();
+            }
+            double final_error = corrected_state
+                ? (corrected_state->getGlobalLinkTransform("gripper").translation() - target_vec).norm()
+                : error;
+
+            if (final_error <= CORRECTION_THRESHOLD) {
+                RCLCPP_INFO(logger, "[%s check] Corrective move fixed it - now %.1fmm off", label.c_str(), final_error * 1000.0);
+                return true;
+            }
+
+            RCLCPP_ERROR(logger, "[%s check] Still %.1fmm off after the one corrective attempt - aborting",
+                         label.c_str(), final_error * 1000.0);
+            return false;
+        };
 
         auto sol = task.solutions().front();
         auto compound = dynamic_cast<const mtc::SolutionSequence*>(sol.get());
 
+        bool execution_failed = false;
+        std::string failure_reason;
+
+        // Unified execution of a single MTC sub-trajectory - used for every
+        // stage regardless of whether the overall solution is a compound
+        // sequence (the normal case here, 14 stages) or a lone trajectory.
+        auto runSubTrajectory = [&](const mtc::SubTrajectory* traj) {
+            if (!traj || !traj->trajectory() || execution_failed) return;
+
+            auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
+            std::string group_name = rt->getGroupName();
+            std::string stage_name = traj->creator()->name();
+
+            if (stage_name == "descend to cube") {
+                if (!verifyAndCorrect("pre-grasp", target.position.x, target.position.y, target.position.z,
+                                       achieved_grasp_fixed_orientation, ik_scene)) {
+                    execution_failed = true;
+                    failure_reason = "Pre-grasp position check failed after corrective retry";
+                    return;
+                }
+            } else if (stage_name == "open gripper place") {
+                if (!verifyAndCorrect("place-descend", place_x, place_y, place_z,
+                                       achieved_place_descend_orientation, transit_scene)) {
+                    execution_failed = true;
+                    failure_reason = "Place position check failed after corrective retry";
+                    return;
+                }
+            }
+
+            MoveGroupInterface::Plan plan;
+            RCLCPP_INFO(logger, "Executing '%s' trajectory...", stage_name.c_str());
+            publishStage(stage_name);
+
+            trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+            totg.computeTimeStamps(*rt, 0.1, 0.1);
+            rt->getRobotTrajectoryMsg(plan.trajectory);
+
+            if (plan.trajectory.joint_trajectory.points.empty()) return;
+
+            moveit::core::MoveItErrorCode exec_result;
+            if (group_name == "gripper") {
+                if (stage_name == "open gripper place") {
+                    RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
+                    arm_group.detachObject(OBJECT_ID);
+
+                    RCLCPP_INFO(logger, "Detaching cube in Gazebo...");
+                    auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                    auto detach_future = detach_client_->async_send_request(detach_req);
+                    auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
+                    if (detach_status == std::future_status::ready) {
+                        auto detach_res = detach_future.get();
+                        if (detach_res->success) {
+                            RCLCPP_INFO(logger, "Cube detached from Gazebo: %s", detach_res->message.c_str());
+                        } else {
+                            RCLCPP_ERROR(logger, "Failed to detach in Gazebo: %s", detach_res->message.c_str());
+                        }
+                    } else {
+                        RCLCPP_ERROR(logger, "Gazebo detach service timeout!");
+                    }
+                    rclcpp::sleep_for(std::chrono::milliseconds(100));
+                }
+                exec_result = gripper_group.execute(plan);
+            } else {
+                if (stage_name == "lift up") {
+                    RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
+                    bool attached = arm_group.attachObject(OBJECT_ID, "gripper", touch_links);
+                    if (attached) {
+                        RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
+                    } else {
+                        RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
+                    }
+
+                    RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
+                    auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                    auto attach_future = attach_client_->async_send_request(attach_req);
+                    auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
+                    if (attach_status == std::future_status::ready) {
+                        auto attach_res = attach_future.get();
+                        if (attach_res->success) {
+                            RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
+                        } else {
+                            RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
+                        }
+                    } else {
+                        RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
+                    }
+                    rclcpp::sleep_for(std::chrono::milliseconds(100));
+                }
+                exec_result = arm_group.execute(plan);
+            }
+
+            // CRITICAL: stop immediately if a stage didn't actually execute -
+            // otherwise every later stage (planned assuming this one HAD
+            // moved the robot) keeps getting sent anyway, cascading into a
+            // string of aborts and an arm that ends up somewhere nobody planned for.
+            if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                RCLCPP_ERROR(logger, "Execution of '%s' FAILED (error code %d) — stopping here.",
+                             stage_name.c_str(), exec_result.val);
+                execution_failed = true;
+                failure_reason = "Execution of '" + stage_name + "' failed";
+            }
+        };
+
         if (compound) {
             for (const auto& sub : compound->solutions()) {
-                auto traj = dynamic_cast<const mtc::SubTrajectory*>(sub);
-                if (traj && traj->trajectory()) {
-
-                    auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
-                    std::string group_name = rt->getGroupName();
-                    std::string stage_name = traj->creator()->name();
-
-                    MoveGroupInterface::Plan plan;
-                    RCLCPP_INFO(logger, "Executing '%s' trajectory...", stage_name.c_str());
-
-                    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-                    totg.computeTimeStamps(*rt, 0.1, 0.1);
-
-                    rt->getRobotTrajectoryMsg(plan.trajectory);
-
-                    if (plan.trajectory.joint_trajectory.points.empty()) {
-                        continue;
-                    }
-
-                    moveit::core::MoveItErrorCode exec_result;
-                    if (group_name == "gripper") {
-                        if (stage_name == "open gripper place") {
-                            RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
-                            arm_group.detachObject("red_cube");
-
-                            // DETACH IN GAZEBO
-                            RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
-                            auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
-                            auto detach_future = detach_client->async_send_request(detach_req);
-
-                            auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
-                            if (detach_status == std::future_status::ready) {
-                                auto detach_res = detach_future.get();
-                                if (detach_res->success) {
-                                    RCLCPP_INFO(logger, "Cube detached from Gazebo: %s", detach_res->message.c_str());
-                                } else {
-                                    RCLCPP_ERROR(logger, "Failed to detach in Gazebo: %s", detach_res->message.c_str());
-                                }
-                            } else {
-                                RCLCPP_ERROR(logger, "Gazebo detach service timeout!");
-                            }
-                            rclcpp::sleep_for(std::chrono::milliseconds(100));
-                        }
-                        exec_result = gripper_group.execute(plan);
-                    } else {
-                        if (stage_name == "lift up") {
-                            RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
-                            bool attached = arm_group.attachObject("red_cube", "gripper", touch_links);
-                            if (attached) {
-                                RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
-                            } else {
-                                RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
-                            }
-
-                            // ATTACH IN GAZEBO
-                            RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
-                            auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
-                            auto attach_future = attach_client->async_send_request(attach_req);
-
-                            auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
-                            if (attach_status == std::future_status::ready) {
-                                auto attach_res = attach_future.get();
-                                if (attach_res->success) {
-                                    RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
-                                } else {
-                                    RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
-                                }
-                            } else {
-                                RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
-                            }
-                            rclcpp::sleep_for(std::chrono::milliseconds(100));
-                        }
-                        exec_result = arm_group.execute(plan);
-                    }
-
-                    // CRITICAL: stop immediately if a stage didn't actually execute. Without
-                    // this check, a single aborted stage (e.g. "start point deviates from
-                    // current robot state" after a slow gripper close) was silently ignored,
-                    // and every subsequent stage's trajectory — planned assuming the previous
-                    // stage HAD moved the robot — kept getting sent anyway, cascading into a
-                    // string of aborts and an arm that ends up somewhere nobody planned for.
-                    if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
-                        RCLCPP_ERROR(logger, "Execution of '%s' FAILED (error code %d) — stopping here instead of executing further stages.",
-                                     stage_name.c_str(), exec_result.val);
-                        break;
-                    }
-                }
+                runSubTrajectory(dynamic_cast<const mtc::SubTrajectory*>(sub));
+                if (execution_failed) break;
             }
         } else {
-            auto traj = dynamic_cast<const mtc::SubTrajectory*>(sol.get());
-            if (traj && traj->trajectory()) {
-                auto rt = std::make_shared<robot_trajectory::RobotTrajectory>(*traj->trajectory());
-                std::string group_name = rt->getGroupName();
-                std::string stage_name = traj->creator()->name();
-
-                MoveGroupInterface::Plan plan;
-                RCLCPP_INFO(logger, "Executing '%s' trajectory...", stage_name.c_str());
-
-                trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-                totg.computeTimeStamps(*rt, 0.1, 0.1);
-
-                rt->getRobotTrajectoryMsg(plan.trajectory);
-                if (!plan.trajectory.joint_trajectory.points.empty()) {
-                    moveit::core::MoveItErrorCode exec_result;
-                    if (group_name == "gripper") {
-                        if (stage_name == "open gripper place") {
-                            RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
-                            arm_group.detachObject("red_cube");
-
-                            // DETACH IN GAZEBO
-                            RCLCPP_INFO(logger, "Detaching cube from Gazebo...");
-                            auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
-                            auto detach_future = detach_client->async_send_request(detach_req);
-
-                            auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
-                            if (detach_status == std::future_status::ready) {
-                                auto detach_res = detach_future.get();
-                                if (detach_res->success) {
-                                    RCLCPP_INFO(logger, "Cube detached from Gazebo: %s", detach_res->message.c_str());
-                                } else {
-                                    RCLCPP_ERROR(logger, "Failed to detach in Gazebo: %s", detach_res->message.c_str());
-                                }
-                            } else {
-                                RCLCPP_ERROR(logger, "Gazebo detach service timeout!");
-                            }
-                            rclcpp::sleep_for(std::chrono::milliseconds(100));
-                        }
-                        exec_result = gripper_group.execute(plan);
-                    } else {
-                        if (stage_name == "lift up") {
-                            RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
-                            bool attached = arm_group.attachObject("red_cube", "gripper", touch_links);
-                            if (attached) {
-                                RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
-                            } else {
-                                RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
-                            }
-
-                            // ATTACH IN GAZEBO
-                            RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
-                            auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
-                            auto attach_future = attach_client->async_send_request(attach_req);
-
-                            auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
-                            if (attach_status == std::future_status::ready) {
-                                auto attach_res = attach_future.get();
-                                if (attach_res->success) {
-                                    RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
-                                } else {
-                                    RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
-                                }
-                            } else {
-                                RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
-                            }
-                            rclcpp::sleep_for(std::chrono::milliseconds(100));
-                        }
-                        exec_result = arm_group.execute(plan);
-                    }
-
-                    if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
-                        RCLCPP_ERROR(logger, "Execution of '%s' FAILED (error code %d).",
-                                     stage_name.c_str(), exec_result.val);
-                    }
-                }
-            }
+            runSubTrajectory(dynamic_cast<const mtc::SubTrajectory*>(sol.get()));
         }
-    }
-    else
-    {
-        RCLCPP_ERROR(logger, "MTC Planning FAILED");
+
+        if (execution_failed) {
+            abortWith(failure_reason);
+            return;
+        }
+
+        // ==========================================
+        // DEBUG: Print final positions
+        // ==========================================
+        moveit::core::RobotStatePtr final_state = monitor->getCurrentState();
+        if (final_state) {
+            Eigen::Isometry3d final_w2 = final_state->getGlobalLinkTransform("wrist_2");
+            Eigen::Isometry3d final_grip = final_state->getGlobalLinkTransform("gripper");
+            RCLCPP_INFO(logger, "Final Wrist 2 Pose -> x: %f, y: %f, z: %f",
+                final_w2.translation().x(), final_w2.translation().y(), final_w2.translation().z());
+            RCLCPP_INFO(logger, "Final Gripper Pose -> x: %f, y: %f, z: %f",
+                final_grip.translation().x(), final_grip.translation().y(), final_grip.translation().z());
+        }
+
+        result->success = true;
+        result->message = "Pick-place completed successfully";
+        goal_handle->succeed(result);
+        goal_active_.store(false);
     }
 
-    // ==========================================
-    // DEBUG: Print final positions
-    // ==========================================
-    moveit::core::RobotStatePtr final_state = monitor->getCurrentState();
-    if (final_state) {
-        Eigen::Isometry3d final_w2 = final_state->getGlobalLinkTransform("wrist_2");
-        Eigen::Isometry3d final_grip = final_state->getGlobalLinkTransform("gripper");
-        RCLCPP_INFO(logger, "Final Wrist 2 Pose -> x: %f, y: %f, z: %f",
-            final_w2.translation().x(), final_w2.translation().y(), final_w2.translation().z());
-        RCLCPP_INFO(logger, "Final Gripper Pose -> x: %f, y: %f, z: %f",
-            final_grip.translation().x(), final_grip.translation().y(), final_grip.translation().z());
-    }
+    rclcpp_action::Server<PickPlace>::SharedPtr action_server_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr attach_client_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr detach_client_;
+    std::atomic<bool> goal_active_{false};
+};
 
-    executor.cancel();
-    spinner.join();
-
+int main(int argc, char *argv[])
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<PickPlaceActionServer>();
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

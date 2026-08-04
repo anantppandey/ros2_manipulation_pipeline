@@ -5,6 +5,9 @@ import xacro
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler
+from launch.event_handlers import OnProcessStart
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -31,6 +34,16 @@ def load_yaml(package_name, file_path):
 
 
 def generate_launch_description():
+
+    ############################################################
+    # Launch argument - which cube to pick
+    ############################################################
+
+    target_object_arg = DeclareLaunchArgument(
+        "target_object",
+        default_value="red_cube",
+        description="Which cube to pick: red_cube, blue_cube, or yellow_cube",
+    )
 
     ############################################################
     # Robot Description
@@ -71,9 +84,9 @@ def generate_launch_description():
     }
 
     ############################################################
-    # Joint Limits (THIS IS THE FIX)
+    # Joint Limits
     ############################################################
-    
+
     joint_limits_yaml = load_yaml(
         "giraffe_moveit_config",
         "config/joint_limits.yaml",
@@ -86,7 +99,7 @@ def generate_launch_description():
     ############################################################
     # Planning Pipelines (Required for MTC)
     ############################################################
-    
+
     ompl_yaml = load_yaml(
         "giraffe_moveit_config",
         "config/ompl_planning.yaml",
@@ -98,7 +111,21 @@ def generate_launch_description():
     }
 
     ############################################################
-    # MTC Trial Node
+    # 1. Perception - starts immediately, no MoveIt config needed
+    ############################################################
+
+    object_detector_node = Node(
+        package="giraffe_description",
+        executable="object_detector",
+        output="screen",
+        parameters=[
+            {"use_sim_time": True},
+        ],
+    )
+
+    ############################################################
+    # 2. MTC action server - needs the full MoveIt config that used
+    #    to live in the old pick_place_mtc.launch.py
     ############################################################
 
     mtc_node = Node(
@@ -109,14 +136,47 @@ def generate_launch_description():
             robot_description,
             robot_description_semantic,
             robot_description_kinematics,
-            robot_description_planning,  # <--- ADDED THIS
+            robot_description_planning,
             planning_pipelines,
-            {
-                "use_sim_time": True
-            },
+            {"use_sim_time": True},
         ],
     )
 
+    # Starts once object_detector's process has been spawned - see the
+    # note in the chat reply about what this ordering does and doesn't
+    # guarantee.
+    start_mtc_after_detector = RegisterEventHandler(
+        OnProcessStart(
+            target_action=object_detector_node,
+            on_start=[mtc_node],
+        )
+    )
+
+    ############################################################
+    # 3. Orchestrator - just needs to know which cube to go after
+    ############################################################
+
+    pick_place_orchestrator_node = Node(
+        package="giraffe_mtc",
+        executable="pick_place_orchestrator",
+        output="screen",
+        parameters=[
+            {"target_object": LaunchConfiguration("target_object")},
+            {"use_sim_time": True},
+        ],
+    )
+
+    # Starts once mtc_node's process has been spawned.
+    start_orchestrator_after_mtc = RegisterEventHandler(
+        OnProcessStart(
+            target_action=mtc_node,
+            on_start=[pick_place_orchestrator_node],
+        )
+    )
+
     return LaunchDescription([
-        mtc_node,
+        target_object_arg,
+        object_detector_node,
+        start_mtc_after_detector,
+        start_orchestrator_after_mtc,
     ])

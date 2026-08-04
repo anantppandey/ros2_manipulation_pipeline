@@ -55,6 +55,17 @@ ament_target_dependencies(end_effector_pose
   tf2_geometry_msgs
 )
 
+find_package(vision_msgs REQUIRED)
+
+add_executable(object_detector src/object_detector.cpp)
+ament_target_dependencies(object_detector
+  rclcpp sensor_msgs cv_bridge tf2_ros tf2_geometry_msgs
+  message_filters vision_msgs)
+target_link_libraries(object_detector
+    ${OpenCV_LIBRARIES}
+)
+install(TARGETS object_detector DESTINATION lib/${PROJECT_NAME})
+
 install(
   DIRECTORY launch meshes models urdf rviz config src worlds
   DESTINATION share/${PROJECT_NAME}

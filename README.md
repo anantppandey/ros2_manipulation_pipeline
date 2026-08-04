@@ -232,12 +232,13 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 
 ## To-Do / Roadmap
 
-- Bundle the cube-detector node into the pick-and-place launch file for a single-command startup.
-- Add container detection and pose estimation as well.
-- Further set-dress the simulation world (additional obstacles, tray placement, etc.).
-- Add more coloured cubes and containers.
-- Extend the custom Gazebo plugin beyond simple attach/detach.
-- Revisit the execution architecture for better concurrency ("thread stuff").
+- [X] Bundle the cube-detector node into the pick-and-place launch file for a single-command startup.
+- [X] Add container detection and pose estimation as well.
+- [] Add offsets to detection or add the control loop for final place.
+- [] Further set-dress the simulation world (additional obstacles, tray placement, etc.).
+- [X] Add more coloured cubes and containers.
+- [] Extend the custom Gazebo plugin beyond simple attach/detach for all cubes.
+- [] Revisit the execution architecture for better concurrency ("thread stuff").
 
 
 ## Changelog

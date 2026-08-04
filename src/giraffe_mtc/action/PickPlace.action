@@ -1,0 +1,13 @@
+# Goal - where to pick the object up from, and where to place it.
+# Both are full poses in the "world" frame, same as the old /cube_pose topic.
+geometry_msgs/Pose pick_pose
+geometry_msgs/Pose place_pose
+---
+# Result
+bool success
+string message
+---
+# Feedback - fires once per MTC stage as it starts executing (e.g.
+# "descend to cube", "close gripper", "lift up", ...), plus a couple of
+# setup-phase markers ("initializing", "clearing octomap", "planning").
+string current_stage
