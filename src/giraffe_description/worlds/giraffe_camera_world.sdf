@@ -278,11 +278,12 @@
       </link>
     </model>
 
-    <include>
+    <!-- <include>
       <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Table</uri>
       <name>table</name>
       <pose>0 0.35 0 0 0 0</pose>
-    </include>
+      <scale>0.05 0.05 1.0</scale>
+    </include> -->
 
     <!-- <include>
       <uri>
@@ -290,6 +291,17 @@
       </uri>
       <pose>7.19009 1.09982 0 0 0 0</pose>
     </include> -->
+
+    <include>
+      <uri>model://table</uri>
+      <pose>0 0.25 0 0 0 0</pose>
+      <!-- <scale>0.15 0.15 1.0</scale> -->
+    </include>
+
+    <include>
+        <uri>model://depot_background</uri>
+        <pose>1.09982 1.19009 0 0 0 3.14</pose>
+    </include>
 
   </world>
 </sdf>

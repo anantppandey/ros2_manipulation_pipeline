@@ -1,4 +1,4 @@
-# Copyright 2024 Arpit Chauhan.
+# Copyright 2024 Anant Pandey.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,12 @@ from moveit_configs_utils import MoveItConfigsBuilder
 from launch_ros.actions import Node
 
 import xacro
+
+from launch.actions import SetEnvironmentVariable
+import os
+from ament_index_python.packages import get_package_share_directory
+
+pkg_share = get_package_share_directory("giraffe_description")
 
 # LOAD FILE:
 def load_file(package_name, file_path):
@@ -91,22 +97,55 @@ def generate_launch_description():
                    '-allow_renaming', 'true'],
     )
 
-    load_joint_state_broadcaster = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', '--set-state', 'active',
-             'joint_state_broadcaster'],
-        output='screen'
-    )
+    def make_controller_loader(controller_name, timeout_sec=30.0, poll_interval=0.5):
+        """Load a controller, then drive it to 'active' one lifecycle hop
+        at a time, checking its real reported state each iteration.
 
-    load_arm_controller = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', '--set-state', 'active',
-             'arm_controller'],
-        output='screen'
-    )
-    load_gripper_controller = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', '--set-state', 'active',
-             'gripper_controller'],
-        output='screen'
-    )
+        With a heavier Gazebo world, gz_ros2_control's plugin can take a
+        variable amount of time to finish registering the robot's
+        hardware interfaces with controller_manager, so the final
+        inactive -> active hop needs to be retried rather than attempted
+        once. 'set_controller_state <name> active' does NOT reliably
+        jump unconfigured -> active in one call - it can silently no-op
+        if the controller isn't already inactive, and 'switch_controllers
+        --activate' silently no-ops on an unconfigured controller too
+        (both report success without changing anything, which is worse
+        than a clean failure). So: query the actual state via
+        list_controllers, and take the single correct next step -
+        configure if unconfigured, activate if inactive - retrying until
+        it reports active or timeout_sec elapses (then exit non-zero so
+        the failure is visible instead of the rest of the launch file
+        silently continuing on a broken controller).
+        """
+        max_attempts = int(timeout_sec / poll_interval)
+        script = f"""set -e
+CONTROLLER="{controller_name}"
+ros2 control load_controller "$CONTROLLER" || true
+
+attempt=0
+while true; do
+    STATE=$(ros2 control list_controllers 2>/dev/null | awk -v c="$CONTROLLER" '$1==c {{print $NF}}')
+    if [ "$STATE" = "active" ]; then
+        echo "[$CONTROLLER] active"
+        break
+    elif [ "$STATE" = "inactive" ]; then
+        ros2 control switch_controllers --activate "$CONTROLLER" >/dev/null 2>&1 || true
+    else
+        ros2 control set_controller_state "$CONTROLLER" inactive >/dev/null 2>&1 || true
+    fi
+    attempt=$((attempt+1))
+    if [ "$attempt" -ge {max_attempts} ]; then
+        echo "[$CONTROLLER] still '$STATE' after {timeout_sec}s, giving up" >&2
+        exit 1
+    fi
+    sleep {poll_interval}
+done
+"""
+        return ExecuteProcess(cmd=['bash', '-c', script], output='screen')
+
+    load_joint_state_broadcaster = make_controller_loader('joint_state_broadcaster')
+    load_arm_controller = make_controller_loader('arm_controller')
+    load_gripper_controller = make_controller_loader('gripper_controller')
 
     # # Bridge
     # bridge = Node(
@@ -349,4 +388,7 @@ def generate_launch_description():
         overhead_tf,
         front_tf,
         env_var_plugin_path,
+            SetEnvironmentVariable(
+                "GZ_SIM_RESOURCE_PATH",
+                os.path.join(pkg_share, "models")),
     ])

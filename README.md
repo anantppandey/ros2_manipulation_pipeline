@@ -239,6 +239,7 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 - [X] Add more coloured cubes and containers.
 - [] Extend the custom Gazebo plugin beyond simple attach/detach for all cubes.
 - [] Revisit the execution architecture for better concurrency ("thread stuff").
+- [] If cube wasen't picked up tries again (Already does but after complete execution)
 
 
 ## Changelog
