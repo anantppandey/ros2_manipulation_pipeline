@@ -303,5 +303,15 @@
         <pose>1.09982 1.19009 0 0 0 3.14</pose>
     </include>
 
+    <include>
+        <uri>model://shelf_01</uri>
+        <pose>5.2 -5.2 0 0 0 0</pose>
+    </include>
+
+    <include>
+        <uri>model://shelf_02</uri>
+        <pose>-1.25 -5.2 0 0 0 0</pose>
+    </include>
+
   </world>
 </sdf>
