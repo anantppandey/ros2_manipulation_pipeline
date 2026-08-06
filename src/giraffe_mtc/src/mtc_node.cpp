@@ -40,6 +40,7 @@
 #include <std_srvs/srv/empty.hpp>
 #include <moveit/collision_detection/collision_common.h>
 #include <moveit/robot_state/robot_state.h>
+#include <moveit/robot_model_loader/robot_model_loader.h>
 #include <random>
 
 #include "giraffe_mtc/action/pick_place.hpp"
@@ -580,16 +581,31 @@ private:
         publishStage("initializing");
 
         // ==========================================
-        // 1. INITIALIZE TASK AND ROBOT MODEL
+        // 1. ROBOT MODEL - loaded ONCE, on the first goal, then reused for
+        // every goal after. Previously this called task.loadRobotModel()
+        // fresh every single goal, and PlanningSceneMonitor/MoveGroupInterface
+        // below each independently loaded their OWN robot model too - four
+        // separate pluginlib loads of the same kinematics plugin per goal.
+        // That's what the "class_loader: SEVERE WARNING... will NOT be
+        // unloaded" message at shutdown was actually about: multiple
+        // independent loaders managing the same underlying plugin library.
+        // Now there's exactly one robot_model_loader_ (a member, alive for
+        // the node's whole lifetime), and task/psm/arm_group/gripper_group
+        // below all share the one model it produced.
         // ==========================================
-        mtc::Task task("move_to_cube");
-        task.loadRobotModel(node_ptr);
-        auto robot_model = task.getRobotModel();
+        if (!robot_model_) {
+            RCLCPP_INFO(logger, "Loading robot model (first goal only - reused for every goal after this)...");
+            robot_model_loader_ = std::make_shared<robot_model_loader::RobotModelLoader>(node_ptr, "robot_description");
+            robot_model_ = robot_model_loader_->getModel();
+        }
 
-        if (!robot_model) {
+        if (!robot_model_) {
             abortWith("Failed to load robot model");
             return;
         }
+
+        mtc::Task task("move_to_cube");
+        task.setRobotModel(robot_model_);
 
         // ==========================================
         // 2. GET CURRENT STATE DIRECTLY FROM TF/JOINT_STATES
@@ -597,7 +613,7 @@ private:
         auto tf_buffer = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
         auto monitor = std::make_shared<planning_scene_monitor::CurrentStateMonitor>(
-            node_ptr, robot_model, tf_buffer, true);
+            node_ptr, robot_model_, tf_buffer, true);
 
         RCLCPP_INFO(logger, "Waiting for robot state...");
         monitor->waitForCompleteState("arm", 5.0);
@@ -614,7 +630,7 @@ private:
         Eigen::Isometry3d initial_sp_pose     = current_state->getGlobalLinkTransform("shoulder_pan");
         Eigen::Isometry3d initial_wrist2_pose = current_state->getGlobalLinkTransform("wrist_2");
 
-        auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node_ptr, "robot_description");
+        auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node_ptr, robot_model_loader_);
         psm->startSceneMonitor();
         psm->startWorldGeometryMonitor();
         psm->startStateMonitor();
@@ -668,7 +684,7 @@ private:
         moveit::planning_interface::PlanningSceneInterface psi;
         moveit_msgs::msg::CollisionObject cube;
         cube.id = OBJECT_ID;
-        cube.header.frame_id = robot_model->getModelFrame();
+        cube.header.frame_id = robot_model_->getModelFrame();
         cube.primitives.resize(1);
         cube.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
         cube.primitives[0].dimensions.resize(3);
@@ -680,8 +696,8 @@ private:
         psi.applyCollisionObject(cube);
 
         std::vector<std::string> touch_links;
-        auto arm_links = robot_model->getJointModelGroup("arm")->getLinkModelNames();
-        auto gripper_links = robot_model->getJointModelGroup("gripper")->getLinkModelNames();
+        auto arm_links = robot_model_->getJointModelGroup("arm")->getLinkModelNames();
+        auto gripper_links = robot_model_->getJointModelGroup("gripper")->getLinkModelNames();
         touch_links.insert(touch_links.end(), arm_links.begin(), arm_links.end());
         touch_links.insert(touch_links.end(), gripper_links.begin(), gripper_links.end());
 
@@ -1055,111 +1071,75 @@ private:
         RCLCPP_INFO(logger, "MTC Planning SUCCESS! Extracting trajectory...");
 
         using moveit::planning_interface::MoveGroupInterface;
-        MoveGroupInterface arm_group(node_ptr, "arm");
-        MoveGroupInterface gripper_group(node_ptr, "gripper");
+        // Both reuse the one shared robot_model_ - see the note at the top of
+        // this function on why (each of these would otherwise independently
+        // load its own kinematics plugin).
+        MoveGroupInterface::Options arm_opts("arm");
+        arm_opts.robot_model = robot_model_;
+        MoveGroupInterface arm_group(node_ptr, arm_opts);
+
+        MoveGroupInterface::Options gripper_opts("gripper");
+        gripper_opts.robot_model = robot_model_;
+        MoveGroupInterface gripper_group(node_ptr, gripper_opts);
         arm_group.startStateMonitor();
         gripper_group.startStateMonitor();
 
         // ==========================================
-        // CORRECTIVE POSITION CHECK - one retry, at two checkpoints
-        //
-        // Checked against the "gripper" link, NOT "wrist_2". Every x/y/z
-        // this file passes into computeFreeOrientationIK/
-        // computeFixedOrientationIK (target, grasp_x/y/z, place_x/y/z) is
-        // already a GRIPPER position - see "APPLY OFFSET TO CUBE POSE FOR
-        // GRIPPER IK" above, where GRIPPER_X/Y/Z_OFFSET get added on top of
-        // the raw detected pose. The IK functions solve for wrist_2
-        // internally (target_pos = xyz - orientation * w2_to_grip_vec) so
-        // that the GRIPPER, not wrist_2, ends up at the requested point.
-        // Checking wrist_2 here would be measuring the wrong link by
-        // exactly that fixed offset.
-        //
-        // One corrective attempt only: re-seed IK from the arm's ACTUAL
-        // current state (not the original seed), solve for the same
-        // target position + the same orientation that checkpoint was
-        // already aiming for, then command that as a single move. If
-        // it's still off afterward, abort rather than push on from a
-        // known-bad position.
+        // RE-APPROACH - runs unconditionally at two points, right before
+        // "descend to cube" and right before "open gripper place". Re-solves
+        // IK for the SAME target position the preceding stage was already
+        // aiming for, but seeded from the arm's ACTUAL current state instead
+        // of the original seed_state every other stage in this task was
+        // planned from (that seed was captured once, before any real motion
+        // happened - by this point the arm may have drifted from what the
+        // plan assumed). No distance measurement, no threshold - it always
+        // re-targets the point fresh as one extra move.
         // ==========================================
-        const double CORRECTION_THRESHOLD = 0.01;  // 1cm
-
-        auto verifyAndCorrect = [&](const std::string& label,
+        auto reapproachTarget = [&](const std::string& label,
                                      double x, double y, double z,
                                      const Eigen::Quaterniond& desired_orientation,
                                      const planning_scene::PlanningSceneConstPtr& scene) -> bool
         {
             moveit::core::RobotStatePtr live_state;
             {
-                rclcpp::Time check_time = this->now();
-                if (!monitor->waitForCurrentState(check_time, 1.0)) {
-                    RCLCPP_WARN(logger, "[%s check] Timed out waiting for a fresh robot state - using best available", label.c_str());
+                rclcpp::Time now = this->now();
+                if (!monitor->waitForCurrentState(now, 1.0)) {
+                    RCLCPP_WARN(logger, "[%s] Timed out waiting for a fresh robot state - using best available", label.c_str());
                 }
                 live_state = monitor->getCurrentState();
             }
             if (!live_state) {
-                RCLCPP_WARN(logger, "[%s check] Couldn't get a fresh robot state - skipping check", label.c_str());
-                return true;  // don't block the task over a monitor hiccup
-            }
-
-            Eigen::Vector3d target_vec(x, y, z);
-            Eigen::Vector3d actual = live_state->getGlobalLinkTransform("gripper").translation();
-            double error = (actual - target_vec).norm();
-
-            RCLCPP_INFO(logger, "[%s check] Gripper is %.1fmm from target (%.3f, %.3f, %.3f)",
-                        label.c_str(), error * 1000.0, x, y, z);
-
-            if (error <= CORRECTION_THRESHOLD) {
-                return true;
-            }
-
-            RCLCPP_WARN(logger, "[%s check] Off by %.1fmm (tolerance %.1fmm) - attempting ONE corrective move",
-                        label.c_str(), error * 1000.0, CORRECTION_THRESHOLD * 1000.0);
-
-            std::vector<double> corrective_joint_values;
-            Eigen::Quaterniond corrective_achieved_orientation;
-            if (!computeFixedOrientationIK(live_state.get(), scene, logger, x, y, z,
-                                            desired_orientation, corrective_joint_values,
-                                            corrective_achieved_orientation)) {
-                RCLCPP_ERROR(logger, "[%s check] Corrective IK failed - giving up on this checkpoint", label.c_str());
+                RCLCPP_ERROR(logger, "[%s] Couldn't get a robot state to re-approach from", label.c_str());
                 return false;
             }
 
-            std::map<std::string, double> corrective_targets;
+            std::vector<double> reapproach_joint_values;
+            Eigen::Quaterniond reapproach_achieved_orientation;
+            if (!computeFixedOrientationIK(live_state.get(), scene, logger, x, y, z,
+                                            desired_orientation, reapproach_joint_values,
+                                            reapproach_achieved_orientation)) {
+                RCLCPP_ERROR(logger, "[%s] Re-approach IK failed", label.c_str());
+                return false;
+            }
+
+            std::map<std::string, double> reapproach_targets;
             for (size_t i = 0; i < joint_names.size(); ++i) {
-                corrective_targets[joint_names[i]] = corrective_joint_values[i];
+                reapproach_targets[joint_names[i]] = reapproach_joint_values[i];
                 if (joint_names[i] == "wrist_1_wrist_2_joint") {
-                    corrective_targets[joint_names[i]] += M_PI / 2.0;
+                    reapproach_targets[joint_names[i]] += M_PI / 2.0;
                 }
             }
 
-            arm_group.setJointValueTarget(corrective_targets);
+            arm_group.setJointValueTarget(reapproach_targets);
             moveit::core::MoveItErrorCode move_result = arm_group.move();
             if (move_result != moveit::core::MoveItErrorCode::SUCCESS) {
-                RCLCPP_ERROR(logger, "[%s check] Corrective move failed to execute (error code %d)",
+                RCLCPP_ERROR(logger, "[%s] Re-approach move failed to execute (error code %d)",
                              label.c_str(), move_result.val);
                 return false;
             }
 
-            moveit::core::RobotStatePtr corrected_state;
-            {
-                rclcpp::Time recheck_time = this->now();
-                if (!monitor->waitForCurrentState(recheck_time, 1.0)) {
-                    RCLCPP_WARN(logger, "[%s check] Timed out waiting for a fresh post-correction state - using best available", label.c_str());
-                }
-                corrected_state = monitor->getCurrentState();
-            }
-            double final_error = corrected_state
-                ? (corrected_state->getGlobalLinkTransform("gripper").translation() - target_vec).norm()
-                : error;
-
-            if (final_error <= CORRECTION_THRESHOLD) {
-                RCLCPP_INFO(logger, "[%s check] Corrective move fixed it - now %.1fmm off", label.c_str(), final_error * 1000.0);
-                return true;
-            }
-
-            RCLCPP_ERROR(logger, "[%s check] Still %.1fmm off after the one corrective attempt - aborting",
-                         label.c_str(), final_error * 1000.0);
-            return false;
+            RCLCPP_INFO(logger, "[%s] Re-approach complete", label.c_str());
+            return true;
         };
 
         auto sol = task.solutions().front();
@@ -1179,17 +1159,17 @@ private:
             std::string stage_name = traj->creator()->name();
 
             if (stage_name == "descend to cube") {
-                if (!verifyAndCorrect("pre-grasp", target.position.x, target.position.y, target.position.z,
+                if (!reapproachTarget("pre-grasp re-approach", target.position.x, target.position.y, target.position.z,
                                        achieved_grasp_fixed_orientation, ik_scene)) {
                     execution_failed = true;
-                    failure_reason = "Pre-grasp position check failed after corrective retry";
+                    failure_reason = "Pre-grasp re-approach failed";
                     return;
                 }
             } else if (stage_name == "open gripper place") {
-                if (!verifyAndCorrect("place-descend", place_x, place_y, place_z,
+                if (!reapproachTarget("place re-approach", place_x, place_y, place_z,
                                        achieved_place_descend_orientation, transit_scene)) {
                     execution_failed = true;
-                    failure_reason = "Place position check failed after corrective retry";
+                    failure_reason = "Place re-approach failed";
                     return;
                 }
             }
@@ -1302,6 +1282,9 @@ private:
     }
 
     rclcpp_action::Server<PickPlace>::SharedPtr action_server_;
+    // Loaded once, on the first goal - see the note at the top of execute()
+    moveit::core::RobotModelConstPtr robot_model_;
+    robot_model_loader::RobotModelLoaderPtr robot_model_loader_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr attach_client_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr detach_client_;
     std::atomic<bool> goal_active_{false};
