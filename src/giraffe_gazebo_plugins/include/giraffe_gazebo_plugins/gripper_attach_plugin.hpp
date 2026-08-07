@@ -26,7 +26,7 @@
 #include <gz/sim/System.hh>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_srvs/srv/trigger.hpp>
+#include <giraffe_gazebo_plugins/srv/attach_detach.hpp>
 
 namespace giraffe_gazebo_plugins
 {
@@ -36,28 +36,36 @@ namespace giraffe_gazebo_plugins
 /// attached to (the "parent link", e.g. a gripper) and a link on a
 /// separately-spawned model (the "child model", e.g. an object to pick up).
 ///
-/// This intentionally reuses the same underlying mechanism as Gazebo's
-/// built-in `gz::sim::systems::DetachableJoint` system -- an entity carrying
-/// a `components::DetachableJoint` component, which the physics system
-/// interprets as a fixed joint constraint spanning two different models --
-/// but exposes it through two ROS 2 `std_srvs/srv/Trigger` services
-/// (`~/attach`, `~/detach`, default `/gripper/attach` and `/gripper/detach`)
-/// rather than Gazebo Transport topics. That makes it directly callable,
-/// synchronously, from a MoveIt Task Constructor (or any other ROS 2) node,
-/// which is what makes pick-and-place reliable instead of depending on
-/// friction-only grasping.
+/// Unlike the single-cube version of this plugin, the child model/link are
+/// no longer fixed at SDF-load time: each attach/detach call carries its
+/// own `model_name` (and optional `link_name`), via the custom
+/// `giraffe_gazebo_plugins/srv/AttachDetach` service (defined in this same
+/// package, see srv/AttachDetach.srv), so one plugin
+/// instance can pick up any object in the world -- red_cube, blue_cube,
+/// yellow_cube, or anything else -- just by naming it in the request. The
+/// SDF `<child_model>`/`<child_link>` tags still exist, but only as the
+/// *default* used when a request leaves `model_name`/`link_name` empty, so
+/// existing callers that don't care about multi-object support keep working
+/// unchanged.
 ///
-/// SDF parameters (all optional except noted, matching the stock
-/// DetachableJoint system's naming where possible):
+/// SDF parameters (all optional except noted):
 ///   - `parent_link`  (required): link on this plugin's model to weld from.
-///   - `child_model`  (required): name of the other model to weld to.
-///   - `child_link`   (required): link on the child model to weld to.
+///   - `child_model`  (default "red_cube"): fallback target model when a
+///        request's `model_name` field is empty.
+///   - `child_link`   (default "link"): fallback target link when a
+///        request's `link_name` field is empty.
 ///   - `max_attach_distance` (default 0.08 m): attach requests are refused
-///        if the parent and child links are currently farther apart than
+///        if the parent and target links are currently farther apart than
 ///        this. Prevents a stale/incorrect command from teleport-welding
 ///        the gripper to an object it isn't actually touching.
 ///   - `attach_service` (default "/gripper/attach")
 ///   - `detach_service` (default "/gripper/detach")
+///
+/// The gripper can only ever hold one object at a time: an attach request
+/// while something is already attached fails (unless it names the same
+/// object already held, which is treated as a no-op success), and a detach
+/// request that names an object other than the one currently held fails
+/// rather than silently detaching the wrong thing.
 ///
 /// Threading model: the ROS 2 services run on a dedicated executor thread.
 /// Service callbacks never touch the EntityComponentManager directly --
@@ -93,27 +101,34 @@ private:
     DETACH
   };
 
+  using AttachDetach = giraffe_gazebo_plugins::srv::AttachDetach;
+
   // --- ROS service callbacks (run on the executor thread) ---
   void OnAttach(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> _req,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> _res);
+    const std::shared_ptr<AttachDetach::Request> _req,
+    std::shared_ptr<AttachDetach::Response> _res);
   void OnDetach(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> _req,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> _res);
+    const std::shared_ptr<AttachDetach::Request> _req,
+    std::shared_ptr<AttachDetach::Response> _res);
 
   /// Hands a request to PreUpdate() and blocks until it's processed or
   /// times out. Safe to call from the ROS executor thread.
-  bool SubmitRequest(RequestType _type, std::string & _message);
+  bool SubmitRequest(
+    RequestType _type, const std::string & _modelName,
+    const std::string & _linkName, std::string & _message);
 
   // --- Simulation-thread helpers (only ever called from PreUpdate) ---
-  bool ResolveChildEntities(gz::sim::EntityComponentManager & _ecm);
-  bool DoAttach(gz::sim::EntityComponentManager & _ecm, std::string & _message);
-  bool DoDetach(gz::sim::EntityComponentManager & _ecm, std::string & _message);
+  bool DoAttach(
+    gz::sim::EntityComponentManager & _ecm, const std::string & _requestedModel,
+    const std::string & _requestedLink, std::string & _message);
+  bool DoDetach(
+    gz::sim::EntityComponentManager & _ecm, const std::string & _requestedModel,
+    std::string & _message);
 
   // ---- SDF-configured parameters ----
   std::string parentLinkName{"gripper"};
-  std::string childModelName{"red_cube"};
-  std::string childLinkName{"link"};
+  std::string defaultChildModelName{"red_cube"};
+  std::string defaultChildLinkName{"link"};
   double maxAttachDistance{0.08};
   std::string attachServiceName{"/gripper/attach"};
   std::string detachServiceName{"/gripper/detach"};
@@ -124,6 +139,8 @@ private:
   gz::sim::Entity childModelEntity{gz::sim::kNullEntity};
   gz::sim::Entity childLinkEntity{gz::sim::kNullEntity};
   gz::sim::Entity detachableJointEntity{gz::sim::kNullEntity};
+  std::string currentChildModelName;  // empty when nothing is attached
+  std::string currentChildLinkName;
   bool isAttached{false};
   bool validConfig{false};
 
@@ -131,14 +148,16 @@ private:
   std::mutex requestMutex;
   std::condition_variable requestCv;
   RequestType pendingRequest{RequestType::NONE};
+  std::string pendingModelName;
+  std::string pendingLinkName;
   bool requestComplete{false};
   bool requestSuccess{false};
   std::string requestMessage;
 
   // ---- Embedded ROS 2 node ----
   rclcpp::Node::SharedPtr rosNode;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr attachSrv;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr detachSrv;
+  rclcpp::Service<AttachDetach>::SharedPtr attachSrv;
+  rclcpp::Service<AttachDetach>::SharedPtr detachSrv;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
   std::thread executorThread;
 };

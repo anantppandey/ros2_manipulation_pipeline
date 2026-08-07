@@ -113,6 +113,7 @@ private:
         }
 
         auto goal_msg = PickPlace::Goal();
+        goal_msg.object_id = target;
         goal_msg.pick_pose = pick_det->results[0].pose.pose;
         goal_msg.place_pose = box_det->results[0].pose.pose;
 

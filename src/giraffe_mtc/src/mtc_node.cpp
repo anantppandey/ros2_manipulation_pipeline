@@ -36,8 +36,8 @@
 #include <moveit/utils/moveit_error_code.hpp>
 #include <moveit/task_constructor/stages/modify_planning_scene.h>
 
-#include <std_srvs/srv/trigger.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <giraffe_gazebo_plugins/srv/attach_detach.hpp>
 #include <moveit/collision_detection/collision_common.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit/robot_model_loader/robot_model_loader.h>
@@ -485,8 +485,8 @@ public:
             std::bind(&PickPlaceActionServer::handleCancel, this, std::placeholders::_1),
             std::bind(&PickPlaceActionServer::handleAccepted, this, std::placeholders::_1));
 
-        attach_client_ = this->create_client<std_srvs::srv::Trigger>("/gripper/attach");
-        detach_client_ = this->create_client<std_srvs::srv::Trigger>("/gripper/detach");
+        attach_client_ = this->create_client<giraffe_gazebo_plugins::srv::AttachDetach>("/gripper/attach");
+        detach_client_ = this->create_client<giraffe_gazebo_plugins::srv::AttachDetach>("/gripper/detach");
 
         auto logger = this->get_logger();
         RCLCPP_INFO(logger, "Waiting for Gazebo attach/detach services...");
@@ -557,9 +557,12 @@ private:
             goal_active_.store(false);
         };
 
-        // See the class-level comment above for why this is still a literal
-        // for now rather than derived from which object was actually detected.
-        const std::string OBJECT_ID = "red_cube";
+        // Comes from the orchestrator, which sets object_id on the goal from
+        // whichever detection class_id matched its target_object parameter.
+        // Falls back to "red_cube" if a goal is ever sent without it set
+        // (e.g. a manual `ros2 action send_goal`), so this stays backward
+        // compatible with single-cube use.
+        const std::string OBJECT_ID = goal->object_id.empty() ? "red_cube" : goal->object_id;
 
         // ==========================================
         // TWEAK THESE VALUES FOR TRIAL AND ERROR (unchanged from the original file)
@@ -775,6 +778,20 @@ private:
                                         fix_orientation_grasp_joint_values,
                                         achieved_grasp_fixed_orientation)) {
             abortWith("Fixed-orientation IK failed at pick pose");
+            return;
+        }
+
+        // Refine the fixed-orientation IK using the first solution as the new seed
+        moveit::core::RobotState refined_state(*current_state);
+        refined_state.setJointGroupPositions("arm", fix_orientation_grasp_joint_values);
+        refined_state.update();
+
+        if (!computeFixedOrientationIK(&refined_state, ik_scene, logger,
+                                    target.position.x, target.position.y, target.position.z,
+                                    desired_grasp_orientation,
+                                    fix_orientation_grasp_joint_values,
+                                    achieved_grasp_fixed_orientation)) {
+            abortWith("Second fixed-orientation IK refinement failed at pick pose");
             return;
         }
 
@@ -1191,7 +1208,8 @@ private:
                     arm_group.detachObject(OBJECT_ID);
 
                     RCLCPP_INFO(logger, "Detaching cube in Gazebo...");
-                    auto detach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                    auto detach_req = std::make_shared<giraffe_gazebo_plugins::srv::AttachDetach::Request>();
+                    detach_req->model_name = OBJECT_ID;
                     auto detach_future = detach_client_->async_send_request(detach_req);
                     auto detach_status = detach_future.wait_for(std::chrono::seconds(2));
                     if (detach_status == std::future_status::ready) {
@@ -1218,7 +1236,8 @@ private:
                     }
 
                     RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
-                    auto attach_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+                    auto attach_req = std::make_shared<giraffe_gazebo_plugins::srv::AttachDetach::Request>();
+                    attach_req->model_name = OBJECT_ID;
                     auto attach_future = attach_client_->async_send_request(attach_req);
                     auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
                     if (attach_status == std::future_status::ready) {
@@ -1285,8 +1304,8 @@ private:
     // Loaded once, on the first goal - see the note at the top of execute()
     moveit::core::RobotModelConstPtr robot_model_;
     robot_model_loader::RobotModelLoaderPtr robot_model_loader_;
-    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr attach_client_;
-    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr detach_client_;
+    rclcpp::Client<giraffe_gazebo_plugins::srv::AttachDetach>::SharedPtr attach_client_;
+    rclcpp::Client<giraffe_gazebo_plugins::srv::AttachDetach>::SharedPtr detach_client_;
     std::atomic<bool> goal_active_{false};
 };
 

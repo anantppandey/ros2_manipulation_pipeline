@@ -1,0 +1,13 @@
+# Name of the model to attach to / detach from the gripper, e.g. "red_cube",
+# "blue_cube", "yellow_cube". If empty, the plugin's SDF-configured default
+# <child_model> is used (for attach), or "whatever is currently attached"
+# is used (for detach).
+string model_name
+
+# Name of the link on that model to weld to. If empty, the plugin's
+# SDF-configured default <child_link> is used (typically "link" for all
+# three cubes). Only relevant for attach.
+string link_name
+---
+bool success
+string message

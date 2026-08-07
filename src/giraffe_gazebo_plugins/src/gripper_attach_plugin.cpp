@@ -77,11 +77,11 @@ void CustomAttachPlugin::Configure(
 
   if (_sdf->HasElement("child_model"))
   {
-    this->childModelName = _sdf->Get<std::string>("child_model");
+    this->defaultChildModelName = _sdf->Get<std::string>("child_model");
   }
   if (_sdf->HasElement("child_link"))
   {
-    this->childLinkName = _sdf->Get<std::string>("child_link");
+    this->defaultChildLinkName = _sdf->Get<std::string>("child_link");
   }
   if (_sdf->HasElement("max_attach_distance"))
   {
@@ -98,10 +98,6 @@ void CustomAttachPlugin::Configure(
 
   this->validConfig = true;
 
-  // Best-effort early resolution. It's fine if the child hasn't spawned
-  // yet -- ResolveChildEntities() is re-run on every attach attempt too.
-  this->ResolveChildEntities(_ecm);
-
   // ---- Bring up an embedded ROS 2 node for the attach/detach services ----
   if (!rclcpp::ok())
   {
@@ -113,20 +109,20 @@ void CustomAttachPlugin::Configure(
   this->rosNode = std::make_shared<rclcpp::Node>(
     "gripper_attach_plugin_" + this->model.Name(_ecm));
 
-  this->attachSrv = this->rosNode->create_service<std_srvs::srv::Trigger>(
+  this->attachSrv = this->rosNode->create_service<AttachDetach>(
     this->attachServiceName,
     [this](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+      const std::shared_ptr<AttachDetach::Request> req,
+      std::shared_ptr<AttachDetach::Response> res)
     {
       this->OnAttach(req, res);
     });
 
-  this->detachSrv = this->rosNode->create_service<std_srvs::srv::Trigger>(
+  this->detachSrv = this->rosNode->create_service<AttachDetach>(
     this->detachServiceName,
     [this](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+      const std::shared_ptr<AttachDetach::Request> req,
+      std::shared_ptr<AttachDetach::Response> res)
     {
       this->OnDetach(req, res);
     });
@@ -138,54 +134,52 @@ void CustomAttachPlugin::Configure(
   gzmsg << "[CustomAttachPlugin] Ready on model '" << this->model.Name(_ecm)
         << "'. Attach: '" << this->attachServiceName << "', Detach: '"
         << this->detachServiceName << "', parent_link='"
-        << this->parentLinkName << "', child_model='" << this->childModelName
-        << "', child_link='" << this->childLinkName << "'." << std::endl;
-}
-
-bool CustomAttachPlugin::ResolveChildEntities(gz::sim::EntityComponentManager & _ecm)
-{
-  if (this->childModelEntity == gz::sim::kNullEntity ||
-    !_ecm.HasEntity(this->childModelEntity))
-  {
-    this->childModelEntity = _ecm.EntityByComponents(
-      gz::sim::components::Model(),
-      gz::sim::components::Name(this->childModelName));
-    // Force re-lookup of the link too, in case the model was respawned
-    // under the same name with a new entity id.
-    this->childLinkEntity = gz::sim::kNullEntity;
-  }
-
-  if (this->childModelEntity == gz::sim::kNullEntity)
-  {
-    return false;
-  }
-
-  if (this->childLinkEntity == gz::sim::kNullEntity ||
-    !_ecm.HasEntity(this->childLinkEntity))
-  {
-    this->childLinkEntity = _ecm.EntityByComponents(
-      gz::sim::components::Link(),
-      gz::sim::components::ParentEntity(this->childModelEntity),
-      gz::sim::components::Name(this->childLinkName));
-  }
-
-  return this->childLinkEntity != gz::sim::kNullEntity;
+        << this->parentLinkName << "', default child_model='"
+        << this->defaultChildModelName << "', default child_link='"
+        << this->defaultChildLinkName
+        << "' (both overridable per-call via model_name/link_name)."
+        << std::endl;
 }
 
 bool CustomAttachPlugin::DoAttach(
-  gz::sim::EntityComponentManager & _ecm, std::string & _message)
+  gz::sim::EntityComponentManager & _ecm, const std::string & _requestedModel,
+  const std::string & _requestedLink, std::string & _message)
 {
+  const std::string targetModel =
+    _requestedModel.empty() ? this->defaultChildModelName : _requestedModel;
+  const std::string targetLink =
+    _requestedLink.empty() ? this->defaultChildLinkName : _requestedLink;
+
   if (this->isAttached)
   {
-    _message = "Already attached";
-    return true;
+    if (this->currentChildModelName == targetModel)
+    {
+      _message = "Already attached to '" + targetModel + "'";
+      return true;
+    }
+    _message = "Gripper already holds '" + this->currentChildModelName +
+      "' -- detach it before attaching to '" + targetModel + "'";
+    return false;
   }
 
-  if (!this->ResolveChildEntities(_ecm))
+  gz::sim::Entity modelEntity = _ecm.EntityByComponents(
+    gz::sim::components::Model(),
+    gz::sim::components::Name(targetModel));
+  if (modelEntity == gz::sim::kNullEntity)
   {
-    _message = "Could not resolve child model '" + this->childModelName +
-      "' / link '" + this->childLinkName +
-      "' in the world -- has it spawned yet?";
+    _message = "Could not find model '" + targetModel +
+      "' in the world -- has it spawned yet? Check spelling too.";
+    return false;
+  }
+
+  gz::sim::Entity linkEntity = _ecm.EntityByComponents(
+    gz::sim::components::Link(),
+    gz::sim::components::ParentEntity(modelEntity),
+    gz::sim::components::Name(targetLink));
+  if (linkEntity == gz::sim::kNullEntity)
+  {
+    _message = "Model '" + targetModel + "' has no link named '" +
+      targetLink + "'";
     return false;
   }
 
@@ -195,14 +189,14 @@ bool CustomAttachPlugin::DoAttach(
   std::optional<gz::math::Pose3d> parentPose =
     gz::sim::Link(this->parentLinkEntity).WorldPose(_ecm);
   std::optional<gz::math::Pose3d> childPose =
-    gz::sim::Link(this->childLinkEntity).WorldPose(_ecm);
+    gz::sim::Link(linkEntity).WorldPose(_ecm);
   if (parentPose.has_value() && childPose.has_value())
   {
     double distance = (parentPose->Pos() - childPose->Pos()).Length();
     if (distance > this->maxAttachDistance)
     {
       _message = "Refusing to attach: '" + this->parentLinkName + "' and '" +
-        this->childModelName + "/" + this->childLinkName + "' are " +
+        targetModel + "/" + targetLink + "' are " +
         std::to_string(distance) + " m apart (max allowed " +
         std::to_string(this->maxAttachDistance) +
         " m). Descend further before attaching.";
@@ -218,11 +212,14 @@ bool CustomAttachPlugin::DoAttach(
   _ecm.CreateComponent(
     this->detachableJointEntity,
     gz::sim::components::DetachableJoint(
-      {this->parentLinkEntity, this->childLinkEntity, "fixed"}));
+      {this->parentLinkEntity, linkEntity, "fixed"}));
 
+  this->childModelEntity = modelEntity;
+  this->childLinkEntity = linkEntity;
+  this->currentChildModelName = targetModel;
+  this->currentChildLinkName = targetLink;
   this->isAttached = true;
-  _message = "Attached '" + this->childModelName + "' to '" +
-    this->parentLinkName + "'";
+  _message = "Attached '" + targetModel + "' to '" + this->parentLinkName + "'";
   gzmsg << "[CustomAttachPlugin] " << _message
         << " (joint entity " << this->detachableJointEntity << ")"
         << std::endl;
@@ -230,7 +227,8 @@ bool CustomAttachPlugin::DoAttach(
 }
 
 bool CustomAttachPlugin::DoDetach(
-  gz::sim::EntityComponentManager & _ecm, std::string & _message)
+  gz::sim::EntityComponentManager & _ecm, const std::string & _requestedModel,
+  std::string & _message)
 {
   if (!this->isAttached)
   {
@@ -238,19 +236,34 @@ bool CustomAttachPlugin::DoDetach(
     return true;
   }
 
+  if (!_requestedModel.empty() && _requestedModel != this->currentChildModelName)
+  {
+    _message = "Currently attached object is '" + this->currentChildModelName +
+      "', not '" + _requestedModel + "' -- refusing to detach the wrong object";
+    return false;
+  }
+
   if (this->detachableJointEntity != gz::sim::kNullEntity)
   {
     _ecm.RequestRemoveEntity(this->detachableJointEntity);
   }
   this->detachableJointEntity = gz::sim::kNullEntity;
-  this->isAttached = false;
-  _message = "Detached '" + this->childModelName + "' from '" +
+
+  _message = "Detached '" + this->currentChildModelName + "' from '" +
     this->parentLinkName + "'";
   gzmsg << "[CustomAttachPlugin] " << _message << std::endl;
+
+  this->childModelEntity = gz::sim::kNullEntity;
+  this->childLinkEntity = gz::sim::kNullEntity;
+  this->currentChildModelName.clear();
+  this->currentChildLinkName.clear();
+  this->isAttached = false;
   return true;
 }
 
-bool CustomAttachPlugin::SubmitRequest(RequestType _type, std::string & _message)
+bool CustomAttachPlugin::SubmitRequest(
+  RequestType _type, const std::string & _modelName, const std::string & _linkName,
+  std::string & _message)
 {
   if (!this->validConfig)
   {
@@ -266,6 +279,8 @@ bool CustomAttachPlugin::SubmitRequest(RequestType _type, std::string & _message
   }
 
   this->pendingRequest = _type;
+  this->pendingModelName = _modelName;
+  this->pendingLinkName = _linkName;
   this->requestComplete = false;
 
   bool done = this->requestCv.wait_for(
@@ -284,20 +299,22 @@ bool CustomAttachPlugin::SubmitRequest(RequestType _type, std::string & _message
 }
 
 void CustomAttachPlugin::OnAttach(
-  const std::shared_ptr<std_srvs::srv::Trigger::Request> /*_req*/,
-  std::shared_ptr<std_srvs::srv::Trigger::Response> _res)
+  const std::shared_ptr<AttachDetach::Request> _req,
+  std::shared_ptr<AttachDetach::Response> _res)
 {
   std::string message;
-  _res->success = this->SubmitRequest(RequestType::ATTACH, message);
+  _res->success = this->SubmitRequest(
+    RequestType::ATTACH, _req->model_name, _req->link_name, message);
   _res->message = message;
 }
 
 void CustomAttachPlugin::OnDetach(
-  const std::shared_ptr<std_srvs::srv::Trigger::Request> /*_req*/,
-  std::shared_ptr<std_srvs::srv::Trigger::Response> _res)
+  const std::shared_ptr<AttachDetach::Request> _req,
+  std::shared_ptr<AttachDetach::Response> _res)
 {
   std::string message;
-  _res->success = this->SubmitRequest(RequestType::DETACH, message);
+  _res->success = this->SubmitRequest(
+    RequestType::DETACH, _req->model_name, "", message);
   _res->message = message;
 }
 
@@ -312,6 +329,8 @@ void CustomAttachPlugin::PreUpdate(
 
   std::unique_lock<std::mutex> lock(this->requestMutex);
   RequestType req = this->pendingRequest;
+  std::string modelName = this->pendingModelName;
+  std::string linkName = this->pendingLinkName;
   lock.unlock();
 
   if (req == RequestType::NONE)
@@ -323,11 +342,11 @@ void CustomAttachPlugin::PreUpdate(
   std::string message;
   if (req == RequestType::ATTACH)
   {
-    success = this->DoAttach(_ecm, message);
+    success = this->DoAttach(_ecm, modelName, linkName, message);
   }
   else if (req == RequestType::DETACH)
   {
-    success = this->DoDetach(_ecm, message);
+    success = this->DoDetach(_ecm, modelName, message);
   }
 
   lock.lock();

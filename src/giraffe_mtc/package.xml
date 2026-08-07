@@ -23,6 +23,7 @@
   <member_of_group>rosidl_interface_packages</member_of_group>
   <depend>rclcpp_action</depend>
   <depend>vision_msgs</depend>
+  <depend>giraffe_gazebo_plugins</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

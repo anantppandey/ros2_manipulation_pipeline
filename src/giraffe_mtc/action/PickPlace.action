@@ -2,6 +2,7 @@
 # Both are full poses in the "world" frame, same as the old /cube_pose topic.
 geometry_msgs/Pose pick_pose
 geometry_msgs/Pose place_pose
+string object_id
 ---
 # Result
 bool success

@@ -5,22 +5,27 @@
   <version>0.1.0</version>
   <description>
     Gazebo Harmonic (gz-sim8) system plugin that creates and removes a
-    runtime fixed joint between the Giraffe arm's gripper and an object,
-    exposed as ROS 2 std_srvs/Trigger services (/gripper/attach,
-    /gripper/detach) for use from a MoveIt Task Constructor pick-and-place
-    pipeline.
+    runtime fixed joint between the Giraffe arm's gripper and a
+    runtime-selectable object (red_cube, blue_cube, yellow_cube, or any
+    other spawned model), exposed as ROS 2 services (/gripper/attach,
+    /gripper/detach, type giraffe_gazebo_plugins/srv/AttachDetach, defined
+    in this same package) for use from a MoveIt Task Constructor
+    pick-and-place pipeline.
   </description>
   <maintainer email="you@example.com">TODO_your_name</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <depend>std_srvs</depend>
   <depend>gz-cmake3</depend>
   <depend>gz-common5</depend>
   <depend>gz-plugin2</depend>
   <depend>gz-sim8</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
     <build_type>ament_cmake</build_type>
