@@ -234,14 +234,17 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 
 - [X] Bundle the cube-detector node into the pick-and-place launch file for a single-command startup.
 - [X] Add container detection and pose estimation as well.
-- [] Add offsets to detection or add the control loop for final place.
+- [X] Add offsets to detection or add the control loop for final place. (The Attach check works as loop control for now)
 - [X] Further set-dress the simulation world (additional obstacles, tray placement, etc.).
 - [X] Add more coloured cubes and containers.
 - [X] Extend the custom Gazebo plugin beyond simple attach/detach for all cubes.
-- [] Revisit the execution architecture for better concurrency ("thread stuff").
 - [X] If cube wasen't picked up tries again (Already does but after complete execution)
-- [] Add check attach success/failure retry logic.
-- [] Fix to movit attach object error.
+- [X] Add check attach success/failure retry logic.
+- [X] Fix to movit attach object error.
+- [] Remove the first head turn.
+- [] Make the error checker value offset in y axis more than error in x axis.
+- [] add floor to bottom so it does not occasionally hit the table while descending.
+- [] Revisit the execution architecture for better concurrency ("thread stuff").
 
 ## Changelog
 

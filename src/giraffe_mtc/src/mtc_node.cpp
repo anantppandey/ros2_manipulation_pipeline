@@ -1213,6 +1213,103 @@ private:
             return false;
         };
 
+        // ==========================================
+        // FAILURE RECOVERY - if the Gazebo attach never succeeds (all
+        // MAX_ATTACH_ATTEMPTS exhausted), the arm is left mid-pick: descended,
+        // gripper closed near the cube, nothing actually attached. Rather than
+        // abort in place, retreat: open the gripper, then drive the arm back
+        // to its starting joint configuration - the same place "return to
+        // start" leaves it at on a normal successful run.
+        //
+        // This deliberately does NOT use arm_group.move()/gripper_group.move()
+        // (a fresh, collision-checked plan against the REAL monitored scene) -
+        // same reason as tryGazeboAttach's comment above: the gripper is
+        // currently touching the cube, and the real scene never had that
+        // collision pair allowed (only MTC's own internal scene copy did,
+        // and even that path now only mirrors an attach that's already
+        // confirmed in Gazebo - see the "lift up" handling below). Any live
+        // re-plan from this start state would hit START_STATE_IN_COLLISION
+        // immediately.
+        //
+        // Instead this builds a plain two-waypoint joint-space interpolation
+        // (current state -> start state) by hand and runs it via execute(),
+        // which - like every other stage in this task - does not re-check
+        // collision against the live scene, only time-parameterizes and runs
+        // the given trajectory. Real tradeoff: this retreat has no collision
+        // awareness of its own, unlike the OMPL-planned "return to start" MTC
+        // stage used on the success path. Acceptable here because both
+        // endpoints (mid-pick pose, start pose) are ones a normal successful
+        // run already passes through safely.
+        // ==========================================
+        auto recoverArmToStart = [&]() {
+            RCLCPP_WARN(logger, "Recovering: opening gripper and returning arm to start position...");
+
+            // --- Open gripper ---
+            // Deliberately using gripper_group.getCurrentState() / arm_group's
+            // equivalent below, NOT the standalone `monitor` used for
+            // re-approach IK seeding. `monitor` reporting a stale/zero-
+            // timestamped state (see the clock-sync warnings in the logs) is
+            // harmless as an IK seed -- the planner just seeds from a slightly
+            // wrong guess and still converges -- but is NOT harmless here: this
+            // hand-built trajectory has no replanning step, so whatever state
+            // it starts from IS the trajectory's first waypoint, sent straight
+            // to the real controller. A stale start point gets the whole
+            // trajectory instantly rejected by the controller (error -4,
+            // CONTROL_FAILED) as soon as it doesn't match the robot's actual
+            // position -- which is exactly what happened. arm_group/
+            // gripper_group have their own actively-maintained state monitors
+            // (already running via startStateMonitor() above, and proven live
+            // by every successful execute() earlier in this same run).
+            moveit::core::RobotStatePtr gripper_live_state = gripper_group.getCurrentState(2.0);
+            if (!gripper_live_state) {
+                RCLCPP_ERROR(logger, "Recovery: couldn't get gripper's current state - skipping gripper-open, retreating anyway");
+            } else {
+                robot_trajectory::RobotTrajectory gripper_rt(robot_model_, "gripper");
+                gripper_rt.addSuffixWayPoint(*gripper_live_state, 0.0);
+                moveit::core::RobotState gripper_end(*gripper_live_state);
+                double gripper_open_value = 0.0;
+                gripper_end.setJointPositions("wrist_2_gripper_joint", &gripper_open_value);
+                gripper_end.update();
+                gripper_rt.addSuffixWayPoint(gripper_end, 0.0);
+
+                trajectory_processing::TimeOptimalTrajectoryGeneration gripper_totg;
+                gripper_totg.computeTimeStamps(gripper_rt, 0.1, 0.1);
+                MoveGroupInterface::Plan gripper_plan;
+                gripper_rt.getRobotTrajectoryMsg(gripper_plan.trajectory);
+                moveit::core::MoveItErrorCode gripper_result = gripper_group.execute(gripper_plan);
+                if (gripper_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                    RCLCPP_ERROR(logger, "Recovery: failed to open gripper (error code %d) - retreating anyway",
+                                 gripper_result.val);
+                }
+            }
+
+            // --- Retreat arm to its starting configuration ---
+            moveit::core::RobotStatePtr arm_live_state = arm_group.getCurrentState(2.0);
+            if (!arm_live_state) {
+                RCLCPP_ERROR(logger, "Recovery: couldn't get arm's current state - leaving arm where it is");
+                return;
+            }
+
+            robot_trajectory::RobotTrajectory arm_rt(robot_model_, "arm");
+            arm_rt.addSuffixWayPoint(*arm_live_state, 0.0);
+            moveit::core::RobotState arm_end(*arm_live_state);
+            arm_end.setJointGroupPositions("arm", initial_joint_values);
+            arm_end.update();
+            arm_rt.addSuffixWayPoint(arm_end, 0.0);
+
+            trajectory_processing::TimeOptimalTrajectoryGeneration arm_totg;
+            arm_totg.computeTimeStamps(arm_rt, 0.1, 0.1);
+            MoveGroupInterface::Plan arm_plan;
+            arm_rt.getRobotTrajectoryMsg(arm_plan.trajectory);
+            moveit::core::MoveItErrorCode arm_result = arm_group.execute(arm_plan);
+            if (arm_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                RCLCPP_ERROR(logger, "Recovery: failed to retreat arm to start (error code %d)", arm_result.val);
+                return;
+            }
+
+            RCLCPP_INFO(logger, "Recovery complete - arm retreated to start position.");
+        };
+
         auto sol = task.solutions().front();
         auto compound = dynamic_cast<const mtc::SolutionSequence*>(sol.get());
 
@@ -1259,7 +1356,20 @@ private:
             if (group_name == "gripper") {
                 if (stage_name == "open gripper place") {
                     RCLCPP_INFO(logger, "Manually detaching cube from MoveIt planning scene...");
-                    arm_group.detachObject(OBJECT_ID);
+                    // applyAttachedCollisionObject() talks synchronously to move_group's
+                    // real planning scene (same mechanism as psi.applyCollisionObject()
+                    // above, which we know works reliably), instead of
+                    // MoveGroupInterface::detachObject()'s topic-published, cache-dependent
+                    // path that was failing to find the attached body.
+                    moveit_msgs::msg::AttachedCollisionObject detach_msg;
+                    detach_msg.link_name = "gripper";
+                    detach_msg.object.id = OBJECT_ID;
+                    detach_msg.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+                    if (!psi.applyAttachedCollisionObject(detach_msg)) {
+                        RCLCPP_WARN(logger, "MoveIt-side detach reported failure for '%s' -- "
+                                    "continuing anyway, the Gazebo detach below is what "
+                                    "physically matters here.", OBJECT_ID.c_str());
+                    }
 
                     RCLCPP_INFO(logger, "Detaching cube in Gazebo...");
                     auto detach_req = std::make_shared<giraffe_gazebo_plugins::srv::AttachDetach::Request>();
@@ -1298,9 +1408,11 @@ private:
                     }
 
                     if (!gazebo_attached) {
-                        execution_failed = true;
                         failure_reason = "Gazebo attach failed after " + std::to_string(attach_attempt) +
-                                          " attempt(s) - aborting goal so the orchestrator can re-detect the cube and retry fresh";
+                                          " attempt(s) - returned arm to start and aborting so the "
+                                          "orchestrator can re-detect the cube and retry fresh";
+                        recoverArmToStart();
+                        execution_failed = true;
                         return;
                     }
 
@@ -1309,8 +1421,21 @@ private:
                     // otherwise a failed-then-exhausted retry would leave the
                     // planning scene believing the gripper is holding
                     // something it never actually grabbed.
+                    //
+                    // applyAttachedCollisionObject() talks synchronously to move_group's
+                    // real planning scene, embedding the cube's own geometry/pose (reused
+                    // from `cube` above) so this attach doesn't depend on some other,
+                    // possibly-unsynced view already agreeing the object exists -- that
+                    // dependency is what MoveGroupInterface::attachObject() was hitting
+                    // ("no geometry specified and such an object does not exist in the
+                    // collision world").
                     RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
-                    bool attached = arm_group.attachObject(OBJECT_ID, "gripper", touch_links);
+                    moveit_msgs::msg::AttachedCollisionObject attach_msg;
+                    attach_msg.link_name = "gripper";
+                    attach_msg.object = cube;
+                    attach_msg.object.operation = moveit_msgs::msg::CollisionObject::ADD;
+                    attach_msg.touch_links = touch_links;
+                    bool attached = psi.applyAttachedCollisionObject(attach_msg);
                     if (attached) {
                         RCLCPP_INFO(logger, "Cube attached successfully in MoveIt!");
                     } else {
