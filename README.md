@@ -232,6 +232,18 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 
 ## To-Do / Roadmap
 
+#### Functional
+- [] Make the error checker value offset in y axis more than error in x axis.
+- [] Fix the attach happening when cube not in between the two gripper fingers.
+- [] Make it stop once the cube is in box.
+- [] check if the moveit block object is somehow affecting the planning in the first phase causing the issues more.
+- [] add floor to bottom so it does not occasionally hit the table while descending.
+#### Visual
+- [] Make execution faster.
+- [] Remove the first head turn.
+#### Efficiency
+- [] Revisit the execution architecture for better concurrency ("thread stuff").
+#### Done
 - [X] Bundle the cube-detector node into the pick-and-place launch file for a single-command startup.
 - [X] Add container detection and pose estimation as well.
 - [X] Add offsets to detection or add the control loop for final place. (The Attach check works as loop control for now)
@@ -241,10 +253,6 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 - [X] If cube wasen't picked up tries again (Already does but after complete execution)
 - [X] Add check attach success/failure retry logic.
 - [X] Fix to movit attach object error.
-- [] Remove the first head turn.
-- [] Make the error checker value offset in y axis more than error in x axis.
-- [] add floor to bottom so it does not occasionally hit the table while descending.
-- [] Revisit the execution architecture for better concurrency ("thread stuff").
 
 ## Changelog
 
