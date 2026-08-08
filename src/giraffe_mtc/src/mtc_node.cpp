@@ -581,6 +581,13 @@ private:
         double PLACE_APPROACH_CLEARANCE = 0.08;
         double PLACE_DESCEND_DISTANCE = 0.08;
 
+        // If the Gazebo attach service reports failure at "lift up", how many
+        // total attempts (including the first) to make before giving up -
+        // each retry backs off to the pre-grasp hover pose and redoes
+        // descend -> close gripper -> attach from there. See the retry
+        // lambda near the "lift up" execution handling below.
+        const int MAX_ATTACH_ATTEMPTS = 3;
+
         publishStage("initializing");
 
         // ==========================================
@@ -1159,6 +1166,70 @@ private:
             return true;
         };
 
+        // ==========================================
+        // GAZEBO ATTACH RETRY - if the CustomAttachPlugin's /gripper/attach
+        // service reports (or times out on) failure right after "close
+        // gripper", the gripper is closed on the cube in MoveIt's model but
+        // NOT physically attached in the simulator. Continuing on to "lift
+        // up" in that state just lifts an empty gripper. So instead: open
+        // the gripper, re-approach the pre-grasp hover pose, re-descend,
+        // re-close, and try the Gazebo attach call again - up to
+        // MAX_ATTACH_ATTEMPTS total tries - before the goal is aborted.
+        // ==========================================
+        auto moveGripper = [&](const std::string& label, double gripper_joint_value) -> bool {
+            std::map<std::string, double> gripper_target;
+            gripper_target["wrist_2_gripper_joint"] = gripper_joint_value;
+            gripper_group.setJointValueTarget(gripper_target);
+            moveit::core::MoveItErrorCode move_result = gripper_group.move();
+            if (move_result != moveit::core::MoveItErrorCode::SUCCESS) {
+                RCLCPP_ERROR(logger, "[%s] Gripper move failed to execute (error code %d)",
+                             label.c_str(), move_result.val);
+                return false;
+            }
+            return true;
+        };
+
+        auto tryGazeboAttach = [&]() -> bool {
+            auto attach_req = std::make_shared<giraffe_gazebo_plugins::srv::AttachDetach::Request>();
+            attach_req->model_name = OBJECT_ID;
+            auto attach_future = attach_client_->async_send_request(attach_req);
+            auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
+            if (attach_status != std::future_status::ready) {
+                RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
+                return false;
+            }
+            auto attach_res = attach_future.get();
+            if (attach_res->success) {
+                RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
+                return true;
+            }
+            RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
+            return false;
+        };
+
+        auto retryGraspFromPreGrasp = [&](int attempt_num) -> bool {
+            RCLCPP_WARN(logger, "Gazebo attach failed - retrying from pre-grasp (attempt %d/%d)...",
+                        attempt_num, MAX_ATTACH_ATTEMPTS);
+            publishStage("retrying grasp");
+
+            if (!moveGripper("retry: open gripper", 1.0)) return false;
+
+            // Back to the pre-grasp hover pose above the cube...
+            if (!reapproachTarget("retry pre-grasp move", target.position.x, target.position.y, target.position.z,
+                                   achieved_grasp_fixed_orientation, ik_scene)) {
+                return false;
+            }
+            // ...then back down to the grasp pose...
+            if (!reapproachTarget("retry descend to cube", grasp_x, grasp_y, grasp_z,
+                                   achieved_descend_orientation, grasp_scene)) {
+                return false;
+            }
+            // ...and close the gripper again before the next attach attempt.
+            if (!moveGripper("retry: close gripper", 0.475)) return false;
+
+            return true;
+        };
+
         auto sol = task.solutions().front();
         auto compound = dynamic_cast<const mtc::SolutionSequence*>(sol.get());
 
@@ -1227,6 +1298,30 @@ private:
                 exec_result = gripper_group.execute(plan);
             } else {
                 if (stage_name == "lift up") {
+                    RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
+                    bool gazebo_attached = tryGazeboAttach();
+
+                    int attach_attempt = 1;
+                    while (!gazebo_attached && attach_attempt < MAX_ATTACH_ATTEMPTS) {
+                        ++attach_attempt;
+                        if (!retryGraspFromPreGrasp(attach_attempt)) {
+                            RCLCPP_ERROR(logger, "Retry sequence itself failed - giving up on attach retries");
+                            break;
+                        }
+                        gazebo_attached = tryGazeboAttach();
+                    }
+
+                    if (!gazebo_attached) {
+                        execution_failed = true;
+                        failure_reason = "Gazebo attach failed after " + std::to_string(attach_attempt) + " attempt(s)";
+                        return;
+                    }
+
+                    // Only mirror the attach into MoveIt's planning scene once
+                    // the cube is confirmed physically attached in Gazebo -
+                    // otherwise a failed-then-exhausted retry would leave the
+                    // planning scene believing the gripper is holding
+                    // something it never actually grabbed.
                     RCLCPP_INFO(logger, "Manually attaching cube to gripper in MoveIt planning scene...");
                     bool attached = arm_group.attachObject(OBJECT_ID, "gripper", touch_links);
                     if (attached) {
@@ -1235,21 +1330,6 @@ private:
                         RCLCPP_ERROR(logger, "Cube FAILED to attach in MoveIt!");
                     }
 
-                    RCLCPP_INFO(logger, "Attaching cube in Gazebo...");
-                    auto attach_req = std::make_shared<giraffe_gazebo_plugins::srv::AttachDetach::Request>();
-                    attach_req->model_name = OBJECT_ID;
-                    auto attach_future = attach_client_->async_send_request(attach_req);
-                    auto attach_status = attach_future.wait_for(std::chrono::seconds(2));
-                    if (attach_status == std::future_status::ready) {
-                        auto attach_res = attach_future.get();
-                        if (attach_res->success) {
-                            RCLCPP_INFO(logger, "Cube attached in Gazebo: %s", attach_res->message.c_str());
-                        } else {
-                            RCLCPP_ERROR(logger, "Failed to attach in Gazebo: %s", attach_res->message.c_str());
-                        }
-                    } else {
-                        RCLCPP_ERROR(logger, "Gazebo attach service timeout!");
-                    }
                     rclcpp::sleep_for(std::chrono::milliseconds(100));
                 }
                 exec_result = arm_group.execute(plan);

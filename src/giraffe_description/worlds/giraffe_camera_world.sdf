@@ -128,7 +128,7 @@
     <model name="collection_box">
       <static>true</static>
 
-      <pose>-0.15 0.3 1.015 0 0 0</pose>
+      <pose>-0.175 0.3 1.015 0 0 0</pose>
 
       <link name="box">
 
@@ -137,7 +137,7 @@
           <pose>0 0 0.005 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.09 0.01</size>
+              <size>0.15 0.15 0.01</size>
             </box>
           </geometry>
         </collision>
@@ -146,7 +146,7 @@
           <pose>0 0 0.005 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.09 0.01</size>
+              <size>0.15 0.15 0.01</size>
             </box>
           </geometry>
         </visual>
@@ -156,7 +156,7 @@
           <pose>0 0 0.0105 0 0 0.785398</pose>
           <geometry>
             <box>
-              <size>0.06 0.004 0.001</size>
+              <size>0.10 0.005 0.001</size>
             </box>
           </geometry>
           <material>
@@ -169,7 +169,7 @@
           <pose>0 0 0.0105 0 0 -0.785398</pose>
           <geometry>
             <box>
-              <size>0.06 0.004 0.001</size>
+              <size>0.10 0.005 0.001</size>
             </box>
           </geometry>
           <material>
@@ -180,76 +180,76 @@
 
         <!-- Left wall -->
         <collision name="left_collision">
-          <pose>0 0.04 0.03 0 0 0</pose>
+          <pose>0 0.07 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.01 0.06</size>
+              <size>0.15 0.01 0.06</size>
             </box>
           </geometry>
         </collision>
 
         <visual name="left_visual">
-          <pose>0 0.04 0.03 0 0 0</pose>
+          <pose>0 0.07 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.01 0.06</size>
+              <size>0.15 0.01 0.06</size>
             </box>
           </geometry>
         </visual>
 
         <!-- Right wall -->
         <collision name="right_collision">
-          <pose>0 -0.04 0.03 0 0 0</pose>
+          <pose>0 -0.07 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.01 0.06</size>
+              <size>0.15 0.01 0.06</size>
             </box>
           </geometry>
         </collision>
 
         <visual name="right_visual">
-          <pose>0 -0.04 0.03 0 0 0</pose>
+          <pose>0 -0.07 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.09 0.01 0.06</size>
+              <size>0.15 0.01 0.06</size>
             </box>
           </geometry>
         </visual>
 
         <!-- Front wall -->
         <collision name="front_collision">
-          <pose>0.04 0 0.03 0 0 0</pose>
+          <pose>0.07 0 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.01 0.07 0.06</size>
+              <size>0.01 0.13 0.06</size>
             </box>
           </geometry>
         </collision>
 
         <visual name="front_visual">
-          <pose>0.04 0 0.03 0 0 0</pose>
+          <pose>0.07 0 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.01 0.07 0.06</size>
+              <size>0.01 0.13 0.06</size>
             </box>
           </geometry>
         </visual>
 
         <!-- Back wall -->
         <collision name="back_collision">
-          <pose>-0.04 0 0.03 0 0 0</pose>
+          <pose>-0.07 0 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.01 0.07 0.06</size>
+              <size>0.01 0.13 0.06</size>
             </box>
           </geometry>
         </collision>
 
         <visual name="back_visual">
-          <pose>-0.04 0 0.03 0 0 0</pose>
+          <pose>-0.07 0 0.03 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.01 0.07 0.06</size>
+              <size>0.01 0.13 0.06</size>
             </box>
           </geometry>
         </visual>
