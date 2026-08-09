@@ -84,6 +84,9 @@ private:
         if (goal_in_flight_.load()) {
             return;  // a pick-place is already running - ignore new detections until it's done
         }
+        if (target_placed_.load()) {
+            return;  // already placed successfully - nothing left to do
+        }
 
         std::string target = this->get_parameter("target_object").as_string();
 
@@ -146,6 +149,7 @@ private:
         switch (result.code) {
             case rclcpp_action::ResultCode::SUCCEEDED:
                 RCLCPP_INFO(this->get_logger(), "Pick-place succeeded: %s", result.result->message.c_str());
+                target_placed_.store(true);  // stop sending new goals
                 break;
             case rclcpp_action::ResultCode::ABORTED:
                 RCLCPP_ERROR(this->get_logger(), "Pick-place aborted: %s", result.result->message.c_str());
@@ -163,6 +167,7 @@ private:
     rclcpp::Subscription<vision_msgs::msg::Detection3DArray>::SharedPtr detections_sub_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
     std::atomic<bool> goal_in_flight_{false};
+    std::atomic<bool> target_placed_{false};
 };
 
 int main(int argc, char *argv[])
