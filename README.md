@@ -233,14 +233,11 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 ## To-Do / Roadmap
 
 #### Functional
-- [] Make the error checker value offset in y axis more than error in x axis.
-- [] Fix the attach happening when cube not in between the two gripper fingers.
-- [] Make it stop once the cube is in box.
-- [] check if the moveit block object is somehow affecting the planning in the first phase causing the issues more.
+- [] Make the error checker value offset in y axis more than error in x axis. (have statistical analysis between the two methords)(suspicion 2 make the cube not be considered while ik calculation suspicion 3 check the cube offset in movit is that casuing the issue?)
 - [] add floor to bottom so it does not occasionally hit the table while descending.
 #### Visual
-- [] Make execution faster.
-- [] Remove the first head turn.
+- [] Make execution faster.(Unified speed control?)
+- [] Remove the first head turn. (make it happen while the calculations happen?)
 #### Efficiency
 - [] Revisit the execution architecture for better concurrency ("thread stuff").
 #### Done
@@ -253,6 +250,13 @@ The arm will detect the cube, plan a collision-aware grasp around any obstacles 
 - [X] If cube wasen't picked up tries again (Already does but after complete execution)
 - [X] Add check attach success/failure retry logic.
 - [X] Fix to movit attach object error.
+- [X] Fix the attach happening when cube not in between the two gripper fingers.
+- [x] Make it stop once the cube is in box.
+- [X] make the cv window text look better. (Removed Text only)
+- [X] change colour of arm sometimes object detection gets confused.
+#### Not Doing
+- [] check if the moveit block object is somehow affecting the planning in the first phase causing the issues more.(NO BALL)
+
 
 ## Changelog
 
