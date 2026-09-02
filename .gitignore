@@ -2,6 +2,8 @@ build/
 install/
 log/
 src/moveit_task_constructor/
+src/giraffe_ppo_reach/
+ros_sb3_venv/
 
 .vscode/
 *.pyc

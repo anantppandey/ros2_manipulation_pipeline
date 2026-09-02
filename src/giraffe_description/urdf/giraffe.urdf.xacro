@@ -4,13 +4,17 @@
     <xacro:include filename="$(find giraffe_description)/urdf/giraffe_ros2_control.xacro" />
     <xacro:giraffe_ros2_control />
 
-    <material name="blue">
-        <color rgba="0 0 0.8 1"/>
+    <material name="color_1">
+        <color rgba="0.46 0.49 0.52 1"/>
     </material>
 
-    <material name="white">
-        <color rgba="0.68 0.70 0.73 1"/>
+    <material name="color_2">
+        <color rgba="0.38 0.44 0.51 1"/>
     </material>
+
+    <!-- <material name="white">
+        <color rgba="0.68 0.70 0.73 1"/>
+    </material> -->
 
     <link name="world"></link>
     <link name="gripper">
@@ -21,7 +25,7 @@
         </inertial>
         <visual name="gripper_visual">
             <origin xyz="-0.0033119954003824857 0.031004368928997047 0.2854674914428595" rpy="-1.578235904251224 0.0005414131158789297 -1.3962152952062392" />
-            <material name="white"/>
+            <material name="color_2"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/gripper.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -41,7 +45,7 @@
         </inertial>
         <visual name="wrist_2_visual">
             <origin xyz="-0.021354214645274042 0.2206097855984012 -0.020899066496239235" rpy="-0.0008359974484128125 -1.562664271760666 3.135766541990315" />
-            <material name="white"/>
+            <material name="color_2"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/wrist_2.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -61,7 +65,7 @@
         </inertial>
         <visual name="wrist_1_visual">
             <origin xyz="0.02743385965284909 -0.010090686685202712 0.07569996720375094" rpy="-3.1415926535489875 0.0007586542251133366 1.2308559912525278e-10" />
-            <material name="white"/>
+            <material name="color_1"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/wrist_1.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -81,7 +85,7 @@
         </inertial>
         <visual name="elbow_visual">
             <origin xyz="-0.01857530598299039 0.008291687482204822 0.009868027761990259" rpy="-1.5707963267127854 -6.404382232928635e-16 3.1415926534651977" />
-            <material name="white"/>
+            <material name="color_2"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/elbow.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -101,7 +105,7 @@
         </inertial>
         <visual name="shoulder_lift_visual">
             <origin xyz="0.013526461857575818 0.04663671319906652 0.1165941136588908" rpy="-1.5707963270017984 0.0007586542251355672 -2.0674688021030666e-10" />
-            <material name="white"/>
+            <material name="color_1"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/shoulder_lift.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -121,7 +125,7 @@
         </inertial>
         <visual name="shoulder_pan_visual">
             <origin xyz="-0.09115887303880836 0.0059308387053767 0.06458670903944891" rpy="-1.998138486507446e-15 1.56795957134278e-13 -1.570037672569761" />
-            <material name="white"/>
+            <material name="color_1"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/shoulder_pan.stl" scale="0.001 0.001 0.001" />
             </geometry>
@@ -141,7 +145,7 @@
         </inertial>
         <visual name="base_link_visual">
             <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
-            <material name="white"/>
+            <material name="color_1"/>
             <geometry>
                 <mesh filename="package://giraffe_description/meshes/base_link.stl" scale="0.001 0.001 0.001" />
             </geometry>

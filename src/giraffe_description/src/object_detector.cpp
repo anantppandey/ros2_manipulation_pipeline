@@ -190,9 +190,9 @@ private:
         array.detections.push_back(det);
 
         cv::drawMarker(frame, pixel, draw_color, cv::MARKER_CROSS, 16, 2);
-        cv::putText(frame, display_label,
-                   cv::Point(pixel.x - 40, pixel.y - 15),
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2);
+        // cv::putText(frame, display_label,
+        //            cv::Point(pixel.x - 40, pixel.y - 15),
+        //            cv::FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2);
     }
 
     void rgbdCallback(const sensor_msgs::msg::Image::ConstSharedPtr& rgb_msg,
@@ -236,9 +236,9 @@ private:
         cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
 
         // Red color range
-        cv::Scalar lower_red1(0, 100, 100);
-        cv::Scalar upper_red1(10, 255, 255);
-        cv::Scalar lower_red2(160, 100, 100);
+        cv::Scalar lower_red1(0, 150, 100);
+        cv::Scalar upper_red1(8, 255, 255);
+        cv::Scalar lower_red2(172, 150, 100);
         cv::Scalar upper_red2(179, 255, 255);
 
         cv::Mat mask1, mask2;
